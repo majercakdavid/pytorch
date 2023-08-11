@@ -1,7 +1,10 @@
 import dataclasses
 import inspect
+import io
 import re
+import pathlib
 import weakref
+import zipfile
 from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -36,6 +39,7 @@ from torch.fx.experimental.symbolic_shapes import (
     StrictMinMaxConstraint,
 )
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo
+from torch.serialization import _open_zipfile_reader, _open_zipfile_writer
 from torch.utils._sympy.value_ranges import ValueRangeError, ValueRanges
 
 from .exported_program import (
@@ -421,6 +425,86 @@ def _reorder_kwargs_by_names(arg_names: List[str], args: Tuple[Any], kwargs: Dic
         f"but got {len(args)} positional args, {len(kwargs)} kwargs."
     )
     return OrderedDict({kw_name: kwargs[kw_name] for kw_name in arg_names[len(args):]})
+
+
+def save(
+    ep: ExportedProgram,
+    f: Union[str, pathlib.Path, io.BytesIO],
+    extra_files: Optional[Dict[str, Any]] = None,
+    opset_version: Optional[Dict[str, int]] = None,
+) -> None:
+    """
+    Saves a version of the given exported program for use in a separate process.
+
+    Args:
+        ep (ExportedProgram): The exported program to save.
+
+        f (str): A file-like object (has to implement write and flush)
+            or a string containing a file name.
+
+        extra_files (Optional[Dict[str, Any]]): Map from filename to contents
+            which will be stored as part of f.
+
+        opset_version (Optional[Dict[str, int]]): A map of opset names
+            to the version of this opset
+    """
+    from .serde.serialize import serialize
+    serialized_program, serialized_state_dict = serialize(ep, opset_version)
+
+    with _open_zipfile_writer(f) as zipf:
+        # Save serialized_ep and serialized_state_dict to the zip file
+        zipf.write_record('serialized_exported_program.json', serialized_program, len(serialized_program))
+        zipf.write_record('serialized_state_dict.json', serialized_state_dict, len(serialized_state_dict))
+
+        # Add extra files if provided
+        if extra_files:
+            for extra_file_name, content in extra_files.items():
+                encoded_content = content.encode('utf-8')
+                zipf.write_record(extra_file_name, encoded_content, len(encoded_content))
+
+
+def load(
+    f: Union[str, pathlib.Path, io.BytesIO],
+    extra_files: Optional[Dict[str, Any]] = None,
+    expected_opset_version: Optional[Dict[str, int]] = None,
+) -> ExportedProgram:
+    """
+    Loads an ExportedProgram previously saved with torch._export.save
+
+    Args:
+        ep (ExportedProgram): The exported program to save.
+
+        f (str): A file-like object (has to implement write and flush)
+            or a string containing a file name.
+
+        extra_files (Optional[Dict[str, Any]]): The extra filenames given in
+            this map would be loaded and their content would be stored in the
+            provided map.
+
+        expected_opset_version (Optional[Dict[str, int]]): A map of opset names
+            to expected opset versions
+
+    Returns:
+        An ExportedProgram object
+    """
+    if isinstance(f, (str, pathlib.Path)):
+        f = str(f)
+
+    with _open_zipfile_reader(f) as zipf:
+        # Load serialized_ep and serialized_state_dict from the zip file
+        serialized_ep = zipf.get_record('serialized_exported_program.json')
+        serialized_state_dict = zipf.get_record('serialized_state_dict.json')
+
+        # Deserialize ExportedProgram
+        from .serde.serialize import deserialize
+        ep = deserialize(serialized_ep, serialized_state_dict, expected_opset_version)
+
+        # Populate extra_files map
+        if extra_files is not None:
+            for filename in extra_files.keys():
+                extra_files[filename] = zipf.get_record(filename).decode('utf-8')
+
+        return ep
 
 
 def aot_compile(
