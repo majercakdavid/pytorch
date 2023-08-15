@@ -5,6 +5,8 @@ from os.path import isfile, join, isdir
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--kernel_dir", type=str, default="./data_hf")
+parser.add_argument("--radius", type=int, default=0)
+parser.add_argument("--timeout", type=int, default=90)
 
 
 def main(args):
@@ -35,26 +37,27 @@ def main(args):
                 py_path = join(kernel_path, py)
                 if not py.endswith(".py"):
                     continue
+                kernel_name = py[:-3]
 
                 # skip graph python file
                 with open(py_path, "r") as file:
                     content = file.read()
-                    if "Original ATen:" in content:
+                    if "AsyncCompile()" in content:
                         print("Skip " + py_path + " GRAPH")
                         continue
 
                 # skip seen kernels
-                if py[:-3] in seen_kernels:
-                    print("Skip " + py_path + " <<<<<< " + py[:-3] + " seen before")
+                if kernel_name in seen_kernels:
+                    print("Skip " + py_path + " <<<<<< " + kernel_name + " seen before")
                     continue
 
                 cache_dir = kernel_path
-                log_path = join(kernel_path, py[:-3] + ".log")
-                all_config_path = join(kernel_path, py[:-3] + ".all_config")
+                log_path = join(kernel_path, kernel_name + ".log")
+                all_config_path = join(kernel_path, kernel_name + ".all_config")
 
+                seen_kernels.add(kernel_name)
                 if os.path.exists(log_path) and os.path.exists(all_config_path):
                     # already benchmarked
-                    seen_kernels.add(py[:-3])
                     continue
                 assert not os.path.exists(log_path) and not os.path.exists(
                     all_config_path
@@ -62,29 +65,25 @@ def main(args):
 
                 my_env = os.environ.copy()
                 my_env["TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE"] = "1"
-                my_env["TORCHINDUCTOR_COORDINATE_DESCENT_TUNING"] = "1"
-                my_env["TORCHINDUCTOR_COORDINATE_DESCENT_RADIUS"] = "2"
-                my_env["TORCHINDUCTOR_COORDINATE_DESCENT_CHECK_ALL_DIRECTIONS"] = "1"
+                if args.radius > 0:
+                    my_env["TORCHINDUCTOR_COORDINATE_DESCENT_TUNING"] = "1"
+                    my_env["TORCHINDUCTOR_COORDINATE_DESCENT_RADIUS"] = str(args.radius)
+                    my_env[
+                        "TORCHINDUCTOR_COORDINATE_DESCENT_CHECK_ALL_DIRECTIONS"
+                    ] = "1"
                 my_env["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
                 my_env["TORCH_LOGS"] = "+inductor"
                 my_env["TORCHINDUCTOR_BENCHMARK_KERNEL"] = "1"
-                cmd = """python3 [[PY_PATH]] > [[LOG_PATH]] 2>&1"""
-                cmd = (
-                    cmd.replace("[[CACHE_DIR]]", cache_dir)
-                    .replace("[[PY_PATH]]", py_path)
-                    .replace("[[LOG_PATH]]", log_path)
-                )
+                cmd = f"""python3 {py_path} > {log_path} 2>&1"""
                 print(cmd)
                 try:
                     pro = subprocess.Popen(
                         cmd, env=my_env, shell=True, preexec_fn=os.setsid
                     )
-                    pro.wait(timeout=90)
+                    pro.wait(timeout=args.time_out)
                 except subprocess.TimeoutExpired as exc:
                     print(exc)
                     os.killpg(os.getpgid(pro.pid), signal.SIGTERM)
-
-                seen_kernels.add(py[:-3])
 
 
 if __name__ == "__main__":

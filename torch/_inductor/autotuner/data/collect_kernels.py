@@ -34,45 +34,31 @@ def main(args):
     DTYPE_LIST = args.dtype.split(",")
     MODE_LIST = args.mode.split(",")
     BENCHMARK_PY = args.benchmark
-    MODE_LIST_PATH = args.model_csv
+    MODEL_LIST_PATH = args.model_csv
 
     if not os.path.exists(LOG_DIR):
         os.mkdir(LOG_DIR)
 
-    template = (
-        (
-            """TORCHINDUCTOR_CACHE_DIR=[[DATA_DIR]]/[[DTYPE]]_[[MODE]]_[[MODEL_NAME]] TORCH_LOGS="+inductor" TORCHINDUCTOR_BENCHMARK_KERNEL=1 python3 [[BENCHMARK_PY]] --[[DTYPE]] --performance --[[MODE]] --inductor -d cuda --filter [[MODEL_NAME]] """
-            + " >"
-            + LOG_DIR
-            + "[[DTYPE]]_[[MODE]]_[[MODEL_NAME]].kernels.log 2>&1"
-        )
-        .replace("[[DATA_DIR]]", DATA_DIR)
-        .replace("[[BENCHMARK_PY]]", BENCHMARK_PY)
-    )
-
     for DTYPE in DTYPE_LIST:
         for MODE in MODE_LIST:
-            model_list_path = MODE_LIST_PATH
+            model_list_path = MODEL_LIST_PATH
             model_names = []
             with open(model_list_path, "r") as f:
                 for line in f.readlines()[1:]:
                     line = line.split(",")[0]
                     model_names.append(line)
-            print(MODE)
             print(model_names)
 
             for model_name in model_names:
-                model_path = "[[DATA_DIR]]/[[DTYPE]]_[[MODE]]_[[MODEL_NAME]]"
-                model_path = (
-                    model_path.replace("[[MODEL_NAME]]", model_name)
-                    .replace("[[MODE]]", MODE)
-                    .replace("[[DTYPE]]", DTYPE)
-                    .replace("[[DATA_DIR]]", DATA_DIR)
+                cache_dir = os.path.join(DATA_DIR, f"{DTYPE}_{MODE}_{model_name}")
+                log_file = os.path.join(
+                    LOG_DIR, f"{DTYPE}_{MODE}_{model_name}.kernels.log"
                 )
 
-                if isdir(model_path):
-                    for kernel in sorted(listdir(model_path)):
-                        kernel_path = join(model_path, kernel)
+                # if cache_dir exists, remove .pkl (raw data) and .best_config (best config) in it
+                if isdir(cache_dir):
+                    for kernel in sorted(listdir(cache_dir)):
+                        kernel_path = join(cache_dir, kernel)
                         if not isdir(kernel_path):
                             continue
                         for file in listdir(kernel_path):
@@ -82,12 +68,8 @@ def main(args):
                                 print(cmd)
                                 os.system(cmd)
 
-                cmd = copy.deepcopy(template)
-                cmd = (
-                    cmd.replace("[[MODEL_NAME]]", model_name)
-                    .replace("[[MODE]]", MODE)
-                    .replace("[[DTYPE]]", DTYPE)
-                )
+                # run benchmark
+                cmd = f"""TORCHINDUCTOR_CACHE_DIR={cache_dir} TORCH_LOGS="+inductor" TORCHINDUCTOR_BENCHMARK_KERNEL=1 python3 {BENCHMARK_PY} --{DTYPE} --performance --{MODE} --inductor -d cuda --only {model_name} > {log_file} 2>&1"""
                 print(cmd)
 
                 os.system(cmd)
