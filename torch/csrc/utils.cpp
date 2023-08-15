@@ -280,9 +280,9 @@ char* tensor_repr(at::Tensor tensor) {
   if (!buf)
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)
     goto error;
+  // account for the trailing \0
   // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
-  result =
-      static_cast<char*>(malloc(bufsize + 1)); // account for the trailing \0
+  result = static_cast<char*>(malloc(bufsize + 1));
   if (!result) {
     fmt::print(stderr, "cannot allocate memory for the result\n");
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-goto,hicpp-avoid-goto)

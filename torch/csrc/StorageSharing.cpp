@@ -196,10 +196,9 @@ static PyObject* THPStorage_shareFd(PyObject* self, PyObject* noargs) {
   const auto& storage = THPStorage_Unpack(self);
   TORCH_CHECK(
       storage.device_type() == at::kCPU, "_share_fd_: only available on CPU");
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  at::MapAllocator* ctx;
+  at::MapAllocator* ctx = at::MapAllocator::fromDataPtr(storage.data_ptr());
   // Storage is already in shared memory, just return a handle
-  if ((ctx = at::MapAllocator::fromDataPtr(storage.data_ptr()))) {
+  if (ctx) {
     // done
   } else {
     at::Storage new_storage(at::new_shm_fd_storage(storage.nbytes()));
@@ -249,10 +248,10 @@ static PyObject* THPStorage_newSharedFd(PyObject* _unused, PyObject* args) {
     return nullptr;
   }
   // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  int fd;
   int tmp_fd = (int)THPUtils_unpackLong(_tmp_fd);
   int64_t size = THPUtils_unpackLong(_size);
-  if ((fd = dup(tmp_fd)) == -1) {
+  int fd = dup(tmp_fd);
+  if (fd == -1) {
     THPUtils_setError("could not duplicate a shared memory file descriptor");
     return nullptr;
   }

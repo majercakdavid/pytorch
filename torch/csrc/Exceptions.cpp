@@ -18,14 +18,17 @@ PyObject *THPException_FatalError, *THPException_LinAlgError,
   if (!(cond))            \
   return false
 bool THPException_init(PyObject* module) {
+  // NOLINTNEXTLINE(bugprone-assignment-in-if-condition)
   ASSERT_TRUE(
       THPException_FatalError =
           PyErr_NewException("torch.FatalError", nullptr, nullptr));
+  // NOLINTNEXTLINE(bugprone-assignment-in-if-condition)
   ASSERT_TRUE(
       PyModule_AddObject(module, "FatalError", THPException_FatalError) == 0);
 
   // Set the doc string here since _add_docstr throws malloc errors if tp_doc is
   // modified for an error class.
+  // NOLINTNEXTLINE(bugprone-assignment-in-if-condition)
   ASSERT_TRUE(
       THPException_LinAlgError = PyErr_NewExceptionWithDoc(
           "torch._C._LinAlgError",
@@ -52,6 +55,7 @@ could not be completed because the input matrix is singular.",
       PyModule_AddObject(module, "_LinAlgError", THPException_LinAlgError) ==
       0);
 
+  // NOLINTNEXTLINE(bugprone-assignment-in-if-condition)
   ASSERT_TRUE(
       THPException_OutOfMemoryError = PyErr_NewExceptionWithDoc(
           "torch.cuda.OutOfMemoryError",
@@ -62,6 +66,7 @@ could not be completed because the input matrix is singular.",
       PyModule_AddObject(
           module, "_OutOfMemoryError", THPException_OutOfMemoryError) == 0);
 
+  // NOLINTNEXTLINE(bugprone-assignment-in-if-condition)
   ASSERT_TRUE(
       THPException_DistBackendError = PyErr_NewExceptionWithDoc(
           "torch.distributed.DistBackendError",
@@ -282,7 +287,7 @@ PyWarningHandler::~PyWarningHandler() noexcept(false) {
             /*category=*/map_warning_to_python_type(warning),
             /*message=*/msg.c_str(),
             /*filename=*/source_location.file,
-            /*lineno=*/source_location.line,
+            /*lineno=*/static_cast<int>(source_location.line),
             /*module=*/nullptr,
             /*registry=*/nullptr);
       } else {
