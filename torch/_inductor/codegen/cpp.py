@@ -1429,7 +1429,9 @@ class CppVecKernel(CppKernel):
         dtype = V.graph.get_dtype(name)
         tiling_var = self.itervars[self.tiling_idx]
         is_broadcast = not index.has(tiling_var)
-        is_mask = dtype in [torch.bool, torch.uint8]
+        is_mask = (
+            dtype in [torch.bool, torch.uint8] and not opt_ctx.is_load_uint8_as_float
+        )
         non_contiguous = (
             not is_broadcast
             and stride_at(tiling_var, index) != 1
