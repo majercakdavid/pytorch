@@ -1,4 +1,3 @@
-import copy
 import argparse
 import os
 from os import listdir

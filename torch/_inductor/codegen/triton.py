@@ -8,7 +8,7 @@ import math
 import operator
 import pickle, os
 from ..utils import get_dtype_size
-from typing import Dict, Iterable, List, Set
+from typing import Dict, Iterable, List, Set, Tuple, NamedTuple
 
 import sympy
 
@@ -19,7 +19,7 @@ from torch import nn
 from torch._prims_common import is_integer_dtype
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from ..._dynamo.utils import counters
-from .. import config, ir, scheduler
+from .. import config, ir, scheduler, dependencies
 from ..codecache import code_hash, get_path
 from ..ir import ReductionHint
 from ..optimize_indexing import indexing_dtype_strength_reduction
@@ -29,7 +29,7 @@ from ..triton_heuristics import (
     reduction_heuristic,
     persistent_reduction_heuristic,
 )
-from ..dependencies import StarDep, WeakDep
+from ..autotuner.model import AutotunerModel
 from ..utils import (
     DeferredLineBase,
     get_fused_kernel_name,
@@ -1905,380 +1905,6 @@ class TritonKernel(Kernel):
         return TritonCSEVariable(*args, **kwargs)
 
 
-#################### Extract feature vector ####################
-import time, copy, os, xgboost, numpy as np
-
-# op_dict needs to be deterministic
-op_dict = {
-    "load": 0,
-    "to_dtype": 1,
-    "add": 2,
-    "reduction": 3,
-    "constant": 4,
-    "div": 5,
-    "store": 6,
-    "sub": 7,
-    "square": 8,
-    "rsqrt": 9,
-    "mul": 10,
-    "tanh": 11,
-    "ne": 12,
-    "where": 13,
-    "indirect_indexing": 14,
-    "log": 15,
-    "neg": 16,
-    "exp": 17,
-    "maximum": 18,
-    "minimum": 19,
-    "index_expr": 20,
-    "ge": 21,
-    "masked": 22,
-    "lt": 23,
-    "and_": 24,
-    "erf": 25,
-    "eq": 26,
-    "le": 27,
-    "gt": 28,
-    "relu": 29,
-    "sqrt": 30,
-    "logical_not": 31,
-    "load_seed": 32,
-    "rand": 33,
-    "abs": 34,
-    "reciprocal": 35,
-    "ceil": 36,
-    "sigmoid": 37,
-    "sin": 38,
-    "cos": 39,
-    "logical_and": 40,
-    "bitwise_and": 41,
-    "randn": 42,
-    "floor": 43,
-    "remainder": 44,
-    "isinf": 45,
-    "logical_or": 46,
-    "expm1": 47,
-    "libdevice_sqrt": 48,
-    "libdevice_log": 49,
-    "truediv": 50,
-    "sign": 51,
-    "randint64": 52,
-    "bitwise_or": 53,
-    "pow": 54,
-    "isnan": 55,
-}
-
-
-class KernelCategory:
-    POINTWISE = 0
-    REDUCTION = 1
-    PERSISTENT_REDUCTION = 2
-
-
-def get_kernel_category(category: str) -> KernelCategory:
-    return {
-        "pointwise": KernelCategory.POINTWISE,
-        "reduction": KernelCategory.REDUCTION,
-        "persistent_reduction": KernelCategory.PERSISTENT_REDUCTION,
-    }[category]
-
-
-def get_number_of_loops(src: str) -> int:
-    return src.count("for roffset in range(0, rnumel, RBLOCK):")
-
-
-def get_tiling(src: str) -> list:
-    names = ["xnumel", "ynumel", "rnumel"]
-    result = list()
-    for name in names:
-        startpos = src.find(name + " =")
-        if startpos == -1:
-            result.append(1)
-            continue
-        endpos = src.find("\n", startpos)
-        result.append(int(src[startpos + len(name + " = ") : endpos]))
-    return result
-
-
-def pad_tensor():
-    tensor_feature = list()
-    tensor_feature.append(False)  # StarDepOrWeakDep
-    tensor_feature.append(0)  # bytes
-    tensor_feature.extend([0] * 6)  # strides
-    tensor_feature.extend([0] * 6)  # size
-    tensor_feature.append(True)  # is_contiguous
-    tensor_feature.append(False)  # is_scalar
-    tensor_feature.append(False)  # is_indirect
-    return tensor_feature
-
-
-def tensor_list(rw_list, rw_len):
-    res = list()
-    rw_list = sorted(rw_list, key=lambda x: x["bytes"], reverse=True)
-    for tensor in rw_list[:rw_len]:
-        tensor_feature = pad_tensor()
-        tensor_feature[0] = tensor["StarDepOrWeakDep"]
-        tensor_feature[1] = tensor["bytes"]
-        # left pad strides
-        for i in range(len(tensor["strides"])):
-            tensor_feature[8 - (len(tensor["strides"]) - i)] = tensor["strides"][i]
-        # left pad size
-        for i in range(len(tensor["size"])):
-            tensor_feature[14 - (len(tensor["size"]) - i)] = tensor["size"][i]
-        tensor_feature[-3] = tensor["is_contiguous"]
-        tensor_feature[-2] = tensor["is_scalar"]
-        tensor_feature[-1] = tensor["is_indirect"]
-        res.append(tensor_feature)
-    for i in range(rw_len - len(rw_list)):
-        res.append(pad_tensor())
-    return res
-
-
-def get_feature_vec(src: str, configs, autotuner_dict):
-    size_hints = autotuner_dict["size_hints"]
-    kernel_category = autotuner_dict["heuristics"]
-    if kernel_category == "reduction":
-        num_of_loops = get_number_of_loops(src)
-    else:
-        num_of_loops = 0
-    (reads, writes, total_bytes) = autotuner_dict["reads_writes"]
-    op_counts = autotuner_dict["node"].read_writes.op_counts
-
-    op_bag = dict()
-    for op in sorted(op_counts.keys()):
-        assert op in op_dict
-        op_bag[op_dict[op]] = op_counts[op]
-    numels = get_tiling(src)
-
-    def f(rw_list):
-        res_list = list()
-        for dep, bytes in rw_list:
-            dep_dict = dict()
-            if isinstance(dep, (StarDep, WeakDep)):
-                dep_dict["StarDepOrWeakDep"] = True
-                continue
-            else:
-                dep_dict["StarDepOrWeakDep"] = False
-            dep_dict["bytes"] = bytes
-            strides = V.graph.sizevars.stride_hints(dep.index, dep.var_names)
-            dep_dict["strides"] = strides
-            dep_dict["size"] = [int(size_) for size_ in dep.size]
-            dep_dict["is_contiguous"] = dep.is_contiguous()
-            dep_dict["is_scalar"] = dep.is_scalar()
-            dep_dict["is_indirect"] = dep.is_indirect()
-            dep_dict["name"] = dep.name
-
-            assert len(dep.size) == len(strides)
-            for size_ in dep.size:
-                assert size_.is_integer
-            for stride in strides:
-                assert isinstance(stride, int)
-            res_list.append(dep_dict)
-        return res_list
-
-    reads = tensor_list(
-        f(sorted(zip(reads, total_bytes[: len(reads)]), key=lambda x: x[0][0])), 10
-    )
-    writes = tensor_list(
-        f(sorted(zip(writes, total_bytes[len(reads) :]), key=lambda x: x[0][0])), 5
-    )
-
-    X = list()
-    for config in configs:
-        feature_vector = list()
-        feature_vector.append(get_kernel_category(kernel_category))
-        feature_vector.append(num_of_loops)
-        op_bag_vec = [0] * len(op_dict)
-        for op in op_bag:
-            op_bag_vec[op] = op_bag[op]
-        feature_vector.extend(op_bag_vec)
-        size_hints_vec = [1] * 2
-        for i in range(len(size_hints)):
-            size_hints_vec[i] = size_hints[i]
-        feature_vector.extend(size_hints_vec)
-
-        for tensor in reads:
-            feature_vector.extend(tensor)
-        for tensor in writes:
-            feature_vector.extend(tensor)
-
-        if "XBLOCK" in config.kwargs:
-            feature_vector.append(config.kwargs["XBLOCK"])
-        else:
-            feature_vector.append(1)
-        if "YBLOCK" in config.kwargs:
-            feature_vector.append(config.kwargs["YBLOCK"])
-        else:
-            feature_vector.append(1)
-        if "RBLOCK" in config.kwargs:
-            feature_vector.append(config.kwargs["RBLOCK"])
-        else:
-            feature_vector.append(1)
-
-        feature_vector.append(config.num_warps)
-        feature_vector.append(config.num_stages)
-        feature_vector.append(numels[0])
-        feature_vector.append(numels[1])
-        feature_vector.append(numels[2])
-
-        X.append(feature_vector)
-
-    return np.array(X)
-
-
-class SearchSpaceGenerator:
-    def __init__(self, size_hints):
-        self.size_hints = size_hints
-
-    def get_xmax(self):
-        xmax = config.triton.max_block["X"]
-        if self.size_hints and len(self.size_hints) > 0:
-            xmax = min(xmax, self.size_hints[0])
-        return xmax
-
-    def get_ymax(self):
-        ymax = config.triton.max_block["Y"]
-        if self.size_hints and len(self.size_hints) > 1:
-            ymax = min(ymax, self.size_hints[1])
-        return ymax
-
-    def get_zmax(self):
-        zmax = config.triton.max_block["Z"]
-        if self.size_hints and len(self.size_hints) > 2:
-            zmax = min(zmax, self.size_hints[2])
-        return zmax
-
-    def get_rmax(self):
-        if self.size_hints and len(self.size_hints) > 0:
-            return self.size_hints[-1]  # the last one is for reduction
-        else:
-            # large enough. We should not pick this large RBLOCK anyway
-            return 2**30
-
-    @property
-    def tunable_fields(self):
-        out = [
-            "XBLOCK",
-            "YBLOCK",
-            "ZBLOCK",
-            # NOTE: we should not tune RBLOCK for persistent reduction.
-            # We rely on the fact that persistent reduction's triton.Config
-            # does not have the RBLOCK field to guarantee that.
-            "RBLOCK",
-            # the following 3 are for mm
-            "BLOCK_M",
-            "BLOCK_N",
-            "BLOCK_K",
-            "num_warps",
-        ]
-        return out
-
-    def value_too_large(self, name, val):
-        if name == "XBLOCK":
-            return val > self.get_xmax()
-        if name == "YBLOCK":
-            return val > self.get_ymax()
-        if name == "ZBLOCK":
-            return val > self.get_zmax()
-        if name == "RBLOCK":
-            return val > self.get_rmax()
-
-        return False
-
-    def get_neighbour_values(self, name, orig_val, radius=1, include_self=False):
-        """
-        Get neighbour values in 'radius' steps. The original value is not
-        returned as it's own neighbour.
-        """
-        assert radius >= 1
-
-        def update(cur_val, inc=True):
-            if name == "num_stages":
-                if inc:
-                    return cur_val + 1
-                else:
-                    return cur_val - 1
-            else:
-                if inc:
-                    return cur_val * 2
-                else:
-                    return cur_val // 2
-
-        out = []
-        # increment loop
-        cur_val = orig_val
-        for _ in range(radius):
-            cur_val = update(cur_val, True)
-            if self.value_too_large(name, cur_val):
-                break
-            out.append(cur_val)
-
-        # decrement loop
-        cur_val = orig_val
-        for _ in range(radius):
-            cur_val = update(cur_val, False)
-            if cur_val <= 0:
-                break
-            out.append(cur_val)
-
-        if include_self:
-            out.append(orig_val)
-        return out
-
-    def get_field(self, config, name):
-        if name == "num_warps":
-            return config.num_warps
-        elif name == "num_stages":
-            return config.num_stages
-        else:
-            return config.kwargs.get(name, None)
-
-    def set_field(self, config, name, value):
-        if name == "num_warps":
-            config.num_warps = value
-        elif name == "num_stages":
-            config.num_stages = value
-        else:
-            config.kwargs[name] = value
-
-    def check_all_tuning_directions(
-        self,
-        best_config,
-    ):
-        """
-        Check all directions. We only do this once the regular coordinate
-        descent tuning find no better choices any more.
-        We only have a few tunable fields, so this should be fine.
-        """
-        candidate_values_list = []
-        effective_fields = []
-        for field in self.tunable_fields:
-            old_value = self.get_field(best_config, field)
-            if old_value is None:
-                continue
-            candidate_values = self.get_neighbour_values(
-                field,
-                old_value,
-                radius=2,
-                include_self=True,
-            )
-            candidate_values_list.append(candidate_values)
-            effective_fields.append(field)
-
-        res = list()
-        choices = itertools.product(*candidate_values_list)
-        for choice in choices:
-            assert len(choice) == len(effective_fields)
-            candidate_config = copy.deepcopy(best_config)
-            for new_val, field in zip(choice, effective_fields):
-                self.set_field(candidate_config, field, new_val)
-            res.append(candidate_config)
-        return res
-
-    def generate(self, best_config):
-        return self.check_all_tuning_directions(best_config)
-
-
 def get_heuristic_configs(autotuner_dict):
     assert "heuristics" in autotuner_dict
     assert "meta" in autotuner_dict
@@ -2307,215 +1933,32 @@ def get_heuristic_configs(autotuner_dict):
     raise ValueError(f"Unknown heuristics {heuristics}")
 
 
-# class NN(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-
-#         self.kernel_category_embedding = torch.nn.Embedding(
-#             num_embeddings=3, embedding_dim=32
-#         )
-#         self.num_of_loops_embedding = torch.nn.Embedding(
-#             num_embeddings=10, embedding_dim=32
-#         )
-
-#         self.hidden_dim = [
-#             32 + 32 + 8 * 56 + (323 - 2 - 56),
-#             8192,
-#             4096,
-#             2048,
-#             1024,
-#             512,
-#             256,
-#             128,
-#             64,
-#             32,
-#             1,
-#         ]
-#         self.num_layers = len(self.hidden_dim) - 1
-
-#         # self.op_bag_ln = nn.Linear(55, 32)
-#         self.op_bag_ln = nn.ModuleList([nn.Linear(1, 8) for i in range(56)])
-
-#         self.layers = nn.ModuleList(
-#             [
-#                 nn.Linear(self.hidden_dim[i], self.hidden_dim[i + 1])
-#                 for i in range(self.num_layers)
-#             ]
-#         )
-#         self.norms = nn.ModuleList(
-#             [nn.LayerNorm(self.hidden_dim[i + 1]) for i in range(self.num_layers - 1)]
-#         )
-
-#         torch.nn.init.xavier_normal_(self.kernel_category_embedding.weight)
-#         torch.nn.init.xavier_normal_(self.num_of_loops_embedding.weight)
-#         for layer in list(self.op_bag_ln) + list(self.layers):
-#             torch.nn.init.xavier_normal_(layer.weight)
-#             torch.nn.init.zeros_(layer.bias)
-
-#     def forward(self, x):
-#         x = torch.cat(
-#             [
-#                 self.kernel_category_embedding(x[:, 0].long()),
-#                 self.num_of_loops_embedding(x[:, 1].long()),
-#                 torch.cat(
-#                     [self.op_bag_ln[i](x[:, 2 + i].unsqueeze(1)) for i in range(56)],
-#                     dim=1,
-#                 ),
-#                 x[:, 58:],
-#             ],
-#             dim=1,
-#         )
-#         for norm, layer in zip(self.norms, self.layers[:-1]):
-#             x = torch.nn.functional.leaky_relu(norm(layer(x)))
-#         x = torch.sigmoid(self.layers[-1](x))
-#         return x
-
-
-# class NN(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-
-#         self.kernel_category_embedding = torch.nn.Embedding(
-#             num_embeddings=3, embedding_dim=32
-#         )
-#         self.num_of_loops_embedding = torch.nn.Embedding(
-#             num_embeddings=10, embedding_dim=32
-#         )
-
-#         self.hidden_dim = [
-#             32 + 32 + 8 * 56 + (323 - 2 - 56),
-#             4096,
-#             1024,
-#             32,
-#             1,
-#         ]
-#         self.num_layers = len(self.hidden_dim) - 1
-
-#         # self.op_bag_ln = nn.Linear(55, 32)
-#         self.op_bag_ln = nn.ModuleList([nn.Linear(1, 8) for i in range(56)])
-
-#         self.layers = nn.ModuleList(
-#             [
-#                 nn.Linear(self.hidden_dim[i], self.hidden_dim[i + 1])
-#                 for i in range(self.num_layers)
-#             ]
-#         )
-#         self.norms = nn.ModuleList(
-#             [nn.LayerNorm(self.hidden_dim[i + 1]) for i in range(self.num_layers - 1)]
-#         )
-
-#         torch.nn.init.xavier_normal_(self.kernel_category_embedding.weight)
-#         torch.nn.init.xavier_normal_(self.num_of_loops_embedding.weight)
-#         for layer in list(self.op_bag_ln) + list(self.layers):
-#             torch.nn.init.xavier_normal_(layer.weight)
-#             torch.nn.init.zeros_(layer.bias)
-
-#     def forward(self, x):
-#         x = torch.cat(
-#             [
-#                 self.kernel_category_embedding(x[:, 0].long()),
-#                 self.num_of_loops_embedding(x[:, 1].long()),
-#                 torch.cat(
-#                     [self.op_bag_ln[i](x[:, 2 + i].unsqueeze(1)) for i in range(56)],
-#                     dim=1,
-#                 ),
-#                 x[:, 58:],
-#             ],
-#             dim=1,
-#         )
-#         for norm, layer in zip(self.norms, self.layers[:-1]):
-#             x = torch.nn.functional.leaky_relu(norm(layer(x)))
-#         x = self.layers[-1](x)
-#         return x
-
-
-class NN(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.kernel_category_embedding = torch.nn.Embedding(
-            num_embeddings=3, embedding_dim=32
-        )
-        self.num_of_loops_embedding = torch.nn.Embedding(
-            num_embeddings=10, embedding_dim=32
-        )
-
-        self.hidden_dim = [
-            32 + 32 + 2 * 56 + (323 - 2 - 56),
-            4096,
-            1024,
-            32,
-            1,
-        ]
-        self.num_layers = len(self.hidden_dim) - 1
-
-        # self.op_bag_ln = nn.Linear(55, 32)
-        self.op_bag_ln = nn.ModuleList([nn.Linear(1, 2) for i in range(56)])
-
-        self.layers = nn.ModuleList(
-            [
-                nn.Linear(self.hidden_dim[i], self.hidden_dim[i + 1])
-                for i in range(self.num_layers)
-            ]
-        )
-        self.norms = nn.ModuleList(
-            [nn.LayerNorm(self.hidden_dim[i + 1]) for i in range(self.num_layers - 1)]
-        )
-
-        torch.nn.init.xavier_normal_(self.kernel_category_embedding.weight)
-        torch.nn.init.xavier_normal_(self.num_of_loops_embedding.weight)
-        for layer in list(self.op_bag_ln) + list(self.layers):
-            torch.nn.init.xavier_normal_(layer.weight)
-            torch.nn.init.zeros_(layer.bias)
-
-    def forward(self, x):
-        x = torch.cat(
-            [
-                self.kernel_category_embedding(x[:, 0].long()),
-                self.num_of_loops_embedding(x[:, 1].long()),
-                torch.cat(
-                    [self.op_bag_ln[i](x[:, 2 + i].unsqueeze(1)) for i in range(56)],
-                    dim=1,
-                ),
-                x[:, 58:],
-            ],
-            dim=1,
-        )
-        for norm, layer in zip(self.norms, self.layers[:-1]):
-            x = torch.nn.functional.leaky_relu(layer(x))
-        x = self.layers[-1](x)
-        return x
-
-
 @functools.lru_cache(None)
-def load_model(use_NN=False):
+def load_model(autotuner_path):
     log.debug(f"loading model, pid {os.getpid()}")
-    if not use_NN:
-        ranker = xgboost.XGBRegressor()
-        ranker.load_model(
-            "/scratch/bohanhou/fresh/experiments/xgb_baseline/model_normalize_runtime_all_cpu.bin"
-        )
-    else:
-        ranker = NN().to("cuda")
-        ranker.load_state_dict(
-            torch.load(
-                "/scratch/bohanhou/fresh/experiments/nn_l2r_att/nn...full.3000.6.18446159362793.0.8543786406517029.pt"
-                # "/scratch/bohanhou/fresh/experiments/nn_l2r/nn.full.160.0.34789153933525085.0.8372799754142761" + ".pt"
-                # "/scratch/bohanhou/fresh/experiments/nn_l2r/nn.full.full.5.773046970367432.0.8051015138626099.68.pt"
-                # "/scratch/bohanhou/fresh/experiments/nn_1/nn.full.0.03437263410162072.512.pt"
-            )
-        )
-    return ranker
+    return pickle.load(open(autotuner_path, "rb"))
 
 
 KERNEL_DICT = dict()
 
 
-def autotuner_predict(autotuner_dict):
-    size_hints = autotuner_dict["size_hints"]
-    src = autotuner_dict["src_code"]
-    configs = autotuner_dict["heuristic_configs"]
+class AutotunerRawData(NamedTuple):
+    IO_deps: Tuple[
+        List[dependencies.Dep], List[dependencies.Dep], List[int], List[int], List[int]
+    ]
+    read_write: dependencies.ReadWrites
+    src_code: str
+    autotuner_dict: Dict
 
+    def __repr__(self):
+        return f"AutotunerRawData({self.IO_deps}, {self.read_write}, {self.src_code}, {self.autotuner_dict})"
+
+
+def autotuner_predict(autotuner_raw_data, autotuner_path):
+    autotuner_dict = autotuner_raw_data.autotuner_dict
+    src = autotuner_raw_data.src
+    # get heursitic configs
+    configs = get_heuristic_configs(autotuner_dict)
     if len(configs) == 1:
         return configs[:1]
 
@@ -2531,121 +1974,12 @@ def autotuner_predict(autotuner_dict):
         if no_R:
             tconfig.kwargs.pop("RBLOCK", None)
 
-    use_NN = True
-    X = get_feature_vec(src, configs, autotuner_dict)
-    ranker = load_model(use_NN)
-    if use_NN:
-        X = X.astype(np.float32)
-        X[:, 58:60] = np.log2(X[:, 58:60] + 1)
-        X[:, 315] = np.log2(X[:, 315] + 1)
-        X[:, 316] = np.log2(X[:, 316] + 1)
-        X[:, 317] = np.log2(X[:, 317] + 1)
-        X[:, 320] = np.log2(X[:, 320] + 1)
-        X[:, 321] = np.log2(X[:, 321] + 1)
-        X[:, 322] = np.log2(X[:, 322] + 1)
-
-        for i in range(10):
-            base = 60 + i * 17
-            X[:, base + 1] = np.log2(X[:, base + 1] + 1)
-            X[:, base + 2 : base + 8] = np.log2(
-                np.abs(X[:, base + 2 : base + 8]) + 1
-            ) * np.sign(X[:, base + 2 : base + 8])
-            X[:, base + 8 : base + 14] = np.log2(
-                np.abs(X[:, base + 8 : base + 14]) + 1
-            ) * np.sign(X[:, base + 8 : base + 14])
-
-        for i in range(5):
-            base = 230 + i * 17
-            X[:, base + 1] = np.log2(X[:, base + 1] + 1)
-            X[:, base + 2 : base + 8] = np.log2(
-                np.abs(X[:, base + 2 : base + 8]) + 1
-            ) * np.sign(X[:, base + 2 : base + 8])
-            X[:, base + 8 : base + 14] = np.log2(
-                np.abs(X[:, base + 8 : base + 14]) + 1
-            ) * np.sign(X[:, base + 8 : base + 14])
-
-    # if use_NN:
-    #     ranker.eval()
-    #     indices = np.argsort(
-    #         ranker.forward(torch.from_numpy(X).to("cuda"))
-    #         .detach()
-    #         .cpu()
-    #         .numpy()
-    #         .squeeze()
-    #     )
-    # else:
-    #     indices = np.argsort(ranker.predict(X))[::-1]
-    # sorted_configs = [configs[i] for i in indices]
-    # best_config = sorted_configs[0]
-    # candidates = SearchSpaceGenerator(size_hints).generate(best_config)
-    # X = get_feature_vec(src, candidates, autotuner_dict)
-    # if use_NN:
-    #     X = X.astype(np.float32)
-    #     X[:, 58:60] = np.log2(X[:, 58:60] + 1)
-    #     X[:, 315] = np.log2(X[:, 315] + 1)
-    #     X[:, 316] = np.log2(X[:, 316] + 1)
-    #     X[:, 317] = np.log2(X[:, 317] + 1)
-    #     X[:, 320] = np.log2(X[:, 320] + 1)
-    #     X[:, 321] = np.log2(X[:, 321] + 1)
-    #     X[:, 322] = np.log2(X[:, 322] + 1)
-
-    #     for i in range(10):
-    #         base = 60 + i * 17
-    #         X[:, base + 1] = np.log2(X[:, base + 1] + 1)
-    #         X[:, base + 2 : base + 8] = np.log2(
-    #             np.abs(X[:, base + 2 : base + 8]) + 1
-    #         ) * np.sign(X[:, base + 2 : base + 8])
-    #         X[:, base + 8 : base + 14] = np.log2(
-    #             np.abs(X[:, base + 8 : base + 14]) + 1
-    #         ) * np.sign(X[:, base + 8 : base + 14])
-
-    #     for i in range(5):
-    #         base = 230 + i * 17
-    #         X[:, base + 1] = np.log2(X[:, base + 1] + 1)
-    #         X[:, base + 2 : base + 8] = np.log2(
-    #             np.abs(X[:, base + 2 : base + 8]) + 1
-    #         ) * np.sign(X[:, base + 2 : base + 8])
-    #         X[:, base + 8 : base + 14] = np.log2(
-    #             np.abs(X[:, base + 8 : base + 14]) + 1
-    #         ) * np.sign(X[:, base + 8 : base + 14])
-
-    # if use_NN:
-    #     ranker.eval()
-    #     indices = np.argsort(
-    #         ranker.forward(torch.from_numpy(X).to("cuda"))
-    #         .detach()
-    #         .cpu()
-    #         .numpy()
-    #         .squeeze()
-    #     )
-    # else:
-    #     indices = np.argsort(ranker.predict(X))[::-1]
-    # sorted_candidates = [candidates[i] for i in indices]
-    # # print(
-    # #     autotuner_dict["file_name"],
-    # #     "\n",
-    # #     best_config,
-    # #     ">>>",
-    # #     [(cfg.kwargs, cfg.num_warps) for cfg in sorted_candidates],
-    # # )
-    # return sorted_candidates[:1]
-
-    if use_NN:
-        ranker.eval()
-        indices = np.argsort(
-            ranker.forward(torch.from_numpy(X).to("cuda"))
-            .detach()
-            .cpu()
-            .numpy()
-            .squeeze()
-        )
-    else:
-        indices = np.argsort(ranker.predict(X))[::-1]
-    sorted_configs = [configs[i] for i in indices]
-    # if len(sorted_configs) >= 2:
-    #     return sorted_configs[:2]
-    # else:
-    return sorted_configs[:1]
+    autotuner = load_model(autotuner_path)
+    assert isinstance(autotuner, AutotunerModel)
+    predicted_configs = autotuner.predict(
+        configs, autotuner_raw_data, config.triton.autotuner_space
+    )
+    return predicted_configs
 
 
 def get_reads_writes(cur_scheduler, node):
@@ -2664,12 +1998,16 @@ def get_reads_writes(cur_scheduler, node):
         reads = reads - removed_buffers
 
     dep_removed = list()
+    strides = list()
+    sizes = list()
     node_bytes = list()
 
     def f(rw):
         for buf in rw:
+            cur_dep = None
             for dep in node.read_writes.reads | node.read_writes.writes:
                 if dep.name == buf:
+                    cur_dep = dep
                     dep_removed.append(dep)
 
             if buf in V.graph.name_to_buffer:
@@ -2679,21 +2017,26 @@ def get_reads_writes(cur_scheduler, node):
             else:
                 continue
 
+            strides.append(
+                V.graph.sizevars.stride_hints(cur_dep.index, cur_dep.var_names)
+            )
+            sizes.append([V.graph.sizevars.size_hint(s) for s in buf.get_size()])
             node_bytes.append(
                 V.graph.sizevars.size_hint(sympy_product(buf.get_size()))
                 * get_dtype_size(buf.get_dtype())
             )
 
-    f(reads)
-    f(writes)
+    # To have deterministic order
+    f(sorted(reads))
+    f(sorted(writes))
+    assert len(dep_removed) == len(node_bytes) == len(strides) == len(sizes)
     return (
         dep_removed[: len(reads)],
         dep_removed[len(reads) :],
+        strides,
+        sizes,
         node_bytes,
     )
-
-
-############################################################
 
 
 class TritonScheduling:
@@ -2859,7 +2202,7 @@ class TritonScheduling:
         if schedule_log.isEnabledFor(logging.DEBUG):
             schedule_log.debug("Schedule:\n %s", node_schedule)
 
-        return self.codegen_node_schedule(nodes, node_schedule, numel, rnumel)
+        return self.codegen_node_schedule(node_schedule, numel, rnumel)
 
     @staticmethod
     def reduction_hint(node):
@@ -2955,7 +2298,7 @@ class TritonScheduling:
 
         return tiled_groups, reduction_hint_val, mutations, index_dtype
 
-    def codegen_node_schedule(self, nodes, node_schedule, numel, reduction_numel):
+    def codegen_node_schedule(self, node_schedule, numel, reduction_numel):
         tiled_groups, reduction_hint_val, mutations, index_dtype = self.get_kernel_args(
             node_schedule, numel, reduction_numel
         )
@@ -2969,58 +2312,60 @@ class TritonScheduling:
 
         self.codegen_node_schedule_with_kernel(node_schedule, kernel)
 
-        ################ autotuner inference
-        src_code, autotuner_dict = kernel.codegen_kernel(get_autotuner_dict=True)
-
-        if src_code in KERNEL_DICT:
-            # we have already generated autotuner config for this kernel
-            src_code = KERNEL_DICT[src_code]
-        else:
-            # we have not generated autotuner config for this kernel
-            src_code_before = src_code
+        if (
+            config.triton.dump_autotuner_data
+            or config.triton.autotuner_path is not None
+        ):
+            src_code, autotuner_dict = kernel.codegen_kernel(get_autotuner_dict=True)
+            nodes = filter(
+                lambda n: n not in (EnableReduction, DisableReduction), node_schedule
+            )
             if len(nodes) == 1:
                 node = nodes[0]
             else:
                 node = scheduler.FusedSchedulerNode(self.scheduler, nodes)
-            autotuner_dict["reads_writes"] = get_reads_writes(self.scheduler, node)
-            autotuner_dict["src_code"] = src_code
-            autotuner_dict["heuristic_configs"], _ = get_heuristic_configs(
-                autotuner_dict
+            autotuner_raw_data = AutotunerRawData(
+                IO_deps=get_reads_writes(self.scheduler, node),
+                read_write=node.read_writes,
+                src_code=src_code,
+                autotuner_dict=autotuner_dict,
             )
-            autotuner_dict["node"] = node
-            configs = autotuner_predict(autotuner_dict)
-            src_code = kernel.codegen_kernel(
-                inject_autotuner_config=[(cfg.kwargs, cfg.num_warps) for cfg in configs]
-            )
-            KERNEL_DICT[src_code_before] = src_code
-        ################# autotuner inference
 
-        # src_code = kernel.codegen_kernel()
+            if config.triton.dump_autotuner_data:
+                # autotuner training data dump
+                tuning_metadata_path = self.kernel_path_ + ".pkl"
+                if not os.path.exists(os.path.dirname(tuning_metadata_path)):
+                    os.makedirs(os.path.dirname(tuning_metadata_path))
+                if not os.path.exists(tuning_metadata_path):
+                    log.debug("Kernel path : " + self.kernel_path_)
+                    log.debug("Metadata path : " + tuning_metadata_path)
+                    log.debug(str(autotuner_raw_data))
+                    with open(tuning_metadata_path, "wb") as f:
+                        pickle.dump(autotuner_raw_data, f)
+
+            if config.triton.autotuner_path is not None:
+                # autotuner inference
+                if src_code in KERNEL_DICT:
+                    # we have already generated autotuner config for this kernel
+                    src_code = KERNEL_DICT[src_code]
+                else:
+                    # we have not generated autotuner config for this kernel
+                    src_code_before = src_code
+                    configs = autotuner_predict(
+                        autotuner_raw_data, config.triton.autotuner_path
+                    )
+                    src_code = kernel.codegen_kernel(
+                        inject_autotuner_config=[
+                            (cfg.kwargs, cfg.num_warps) for cfg in configs
+                        ]
+                    )
+                    KERNEL_DICT[src_code_before] = src_code
+            else:
+                src_code = kernel.codegen_kernel()
+        else:
+            src_code = kernel.codegen_kernel()
+
         kernel_name = self.define_kernel(src_code, node_schedule)
-
-        ################ autotuner training data dump
-        # tuning_metadata_path = self.kernel_path_ + ".pkl"
-        # if not os.path.exists(os.path.dirname(tuning_metadata_path)):
-        #     os.makedirs(os.path.dirname(tuning_metadata_path))
-        # if not os.path.exists(tuning_metadata_path):
-        #     log.warning("Kernel path : " + self.kernel_path_)
-        #     log.warning("Metadata path : " + tuning_metadata_path)
-        #     log.warning(autotuner_dict["reads_writes"])
-        #     log.warning([n.node.__str__() for n in nodes])
-        #     log.warning(node.read_writes)
-        #     log.warning(src_code)
-        #     with open(tuning_metadata_path, "wb") as f:
-        #         pickle.dump(
-        #             [
-        #                 autotuner_dict["reads_writes"],
-        #                 [n.node.__str__() for n in nodes],
-        #                 node.read_writes,
-        #                 src_code,
-        #             ],
-        #             f,
-        #         )
-        ################ autotuning training data dump
-
         kernel.call_kernel(kernel_name)
 
         if config.warn_mix_layout:

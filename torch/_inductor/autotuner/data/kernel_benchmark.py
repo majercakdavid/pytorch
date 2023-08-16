@@ -1,7 +1,7 @@
 import argparse
 import subprocess, os, signal
 from os import listdir
-from os.path import isfile, join, isdir
+from os.path import join, isdir
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--kernel_dir", type=str, default="./data_hf")
