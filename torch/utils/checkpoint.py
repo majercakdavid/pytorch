@@ -17,6 +17,9 @@ from typing import (
 from weakref import ReferenceType
 from torch.testing._internal.logging_tensor import LoggingTensorMode, capture_logs
 import platform
+from torch.utils._python_dispatch import TorchDispatchMode
+import torch.fx.traceback as fx_traceback
+from itertools import count
 
 import torch
 
@@ -408,6 +411,10 @@ def checkpoint(
             context managers. The function and its recomputation will be run
             under the first and second context managers respectively.
             This argument is only supported if ``use_reentrant=False``.
+            This is useful e.g. for implementing selective checkpointing.
+            When selective checkpointing is used with torch.compile,
+            random ops (e.g. ``torch.dropout``) and in-place ops (e.g. ``torch.relu_``)
+            are not allowed in checkpointed region.
         determinism_check(str, optional): A string specifying the determinism
             check to perform. By default it is set to ``"default"`` which
             compares the shapes, dtypes, and devices of the recomputed tensors
@@ -1222,3 +1229,54 @@ def _checkpoint_without_reentrant_generator(
         )
 
     return
+
+uid = count(1)
+
+def _mark_recompute_when_compile():
+    if torch._dynamo.is_compiling():
+        fx_traceback.current_meta["recompute"] = next(uid)
+
+
+def _check_can_selective_checkpoint_when_compile(func):
+    if torch._dynamo.is_compiling():  # TODO(yf225): This doesn't work. Do we have a status check API "is AOTAutograd tracing"?
+        assert not func._schema.is_mutable, (
+            "In-place ops are not supported in selective checkpointing region under torch.compile. "
+            + f"Found in-place ops: {func}."
+        )
+        assert torch.Tag.nondeterministic_seeded not in func.tags, (
+            "Random ops are not supported in selective checkpointing region under torch.compile. "
+            + f"Found random ops: {func}."
+        )
+
+
+class CachingTorchDispatchMode(TorchDispatchMode):
+    def __init__(self, policy_fn, storage):
+        self.policy_fn = policy_fn
+        self.storage = storage
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        _check_can_selective_checkpoint_when_compile(func)
+        if kwargs is None:
+            kwargs = {}
+        if self.policy_fn(func, *args, **kwargs):
+            out = func(*args, **kwargs)
+            self.storage.append(out.detach())
+        else:
+            _mark_recompute_when_compile()
+            out = func(*args, **kwargs)
+        return out
+
+
+class CachedTorchDispatchMode(TorchDispatchMode):
+    def __init__(self, policy_fn, storage):
+        self.policy_fn = policy_fn
+        self.storage = storage
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        if self.policy_fn(func, *args, **kwargs):
+            out = self.storage.pop(0)
+        else:
+            out = func(*args, **kwargs)
+        return out
