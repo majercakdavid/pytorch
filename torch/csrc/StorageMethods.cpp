@@ -223,8 +223,7 @@ static PyObject* THPStorage_fromBuffer(
       "function missing required argument 'byte_order' (pos 2)");
   size_t element_size = c10::elementSize(scalar_type);
 
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  bool do_byte_swap;
+  bool do_byte_swap = false;
   if (!is_endian_independent) {
     if (strcmp(byte_order_str, "native") == 0) {
       do_byte_swap = false;
@@ -258,8 +257,7 @@ static PyObject* THPStorage_fromBuffer(
     return nullptr;
   }
 
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  size_t size_bytes;
+  size_t size_bytes = 0;
   if (count < 0) {
     if ((buffer.len - offset) % element_size != 0) {
       PyErr_SetString(

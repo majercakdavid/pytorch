@@ -262,8 +262,7 @@ PyWarningHandler::~PyWarningHandler() noexcept(false) {
   auto& warning_buffer = internal_handler_.warning_buffer_;
 
   if (!warning_buffer.empty()) {
-    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-    PyObject *type, *value, *traceback;
+    PyObject *type = nullptr, *value = nullptr, *traceback = nullptr;
     pybind11::gil_scoped_acquire gil;
     auto result = 0;
     if (in_exception_) {
@@ -318,7 +317,6 @@ PyWarningHandler::~PyWarningHandler() noexcept(false) {
       throw python_error();
     }
     if (in_exception_) {
-      // NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage)
       PyErr_Restore(type, value, traceback);
     }
   }

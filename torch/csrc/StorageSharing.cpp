@@ -247,7 +247,6 @@ static PyObject* THPStorage_newSharedFd(PyObject* _unused, PyObject* args) {
         "a file descriptor (int) and storage size (int)");
     return nullptr;
   }
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   int tmp_fd = (int)THPUtils_unpackLong(_tmp_fd);
   int64_t size = THPUtils_unpackLong(_size);
   int fd = dup(tmp_fd);
@@ -404,16 +403,14 @@ static PyObject* THPStorage_releaseIPCCounter(
 
 #ifdef USE_CUDA
 static std::string THPStorage_bytesAsHandleString(PyObject* handle) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  char* buffer;
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  Py_ssize_t handle_size;
+  char* buffer = nullptr;
+  Py_ssize_t handle_size = 0;
   if (PyBytes_AsStringAndSize(handle, &buffer, &handle_size) == -1) {
-    // NOLINTNEXTLINE(bugprone-string-constructor)
-    return nullptr;
+    THPUtils_assertRet(
+        "", handle_size == CUDA_IPC_HANDLE_SIZE, "incorrect handle");
   }
-  // NOLINTNEXTLINE(bugprone-string-constructor)
-  THPUtils_assert(handle_size == CUDA_IPC_HANDLE_SIZE, "incorrect handle size");
+  THPUtils_assertRet(
+      "", handle_size == CUDA_IPC_HANDLE_SIZE, "incorrect handle size");
   return std::string(buffer, handle_size);
 }
 #endif
@@ -456,6 +453,9 @@ static PyObject* THPStorage_newSharedCuda(PyObject* _unused, PyObject* args) {
     // Ensure that producer prepared all tensor's data
     std::string s_ipc_event_handle =
         THPStorage_bytesAsHandleString(_event_handle);
+    if (s_ipc_event_handle.empty()) {
+      return nullptr;
+    }
     auto ipc_event_handle = reinterpret_cast<const cudaIpcEventHandle_t*>(
         s_ipc_event_handle.c_str());
     // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
@@ -466,12 +466,14 @@ static PyObject* THPStorage_newSharedCuda(PyObject* _unused, PyObject* args) {
   }
 
   std::string s_handle = THPStorage_bytesAsHandleString(_handle);
+  if (s_handle.empty()) {
+    return nullptr;
+  }
   std::shared_ptr<void> basePtr =
       c10::cuda::CUDACachingAllocator::getIpcDevPtr(s_handle);
 
   // Offset the basePtr to reconstruct the real storage
   // devPtr = basePtr + storage_offset
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   void* devPtr = basePtr.get();
   devPtr = (char*)devPtr + storage_offset_bytes;
 

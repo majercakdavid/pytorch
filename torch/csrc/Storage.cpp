@@ -204,7 +204,6 @@ static PyObject* THPStorage_pynew(
     try {
       for (Py_ssize_t i = 0; i < length; i++) {
         item = PySequence_GetItem(sequence, i);
-        // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
         uint8_t value = THPByteUtils_unpackReal(item.get());
         const auto& storage = THPStorage_Unpack(self);
         if (allocator == c10::GetDefaultCPUAllocator()) {
