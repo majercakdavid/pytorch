@@ -57,6 +57,10 @@ auto AccumulateGrad::apply(variable_list&& grads) -> variable_list {
       1 + !post_hooks().empty() /* num_expected_refs */,
       [&grad](at::Tensor&& grad_update) { grad = std::move(grad_update); });
 
+  for (const auto& hook : tensor_post_acc_grad_hooks()) {
+    (*hook)(variable);
+  }
+
   return variable_list();
 }
 
@@ -88,6 +92,11 @@ variable_list AccumulateGrad::apply_with_saved(
       });
   saved.after(variable_copy);
   saved.after(grad_copy);
+
+  for (const auto& hook : tensor_post_acc_grad_hooks()) {
+    (*hook)(variable);
+  }
+
   return variable_list();
 }
 

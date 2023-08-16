@@ -34,5 +34,21 @@ struct PyFunctionPostHook : public FunctionPostHook {
   PyObject* dict;
 };
 
+// PyFunctionTensorPostAccGradHook is a DICTIONARY of PostAccumulateGradHooks,
+// NOT just one hook! Thus, adding one hook is actually just replacing the
+// existing dictionary with a (bigger) dictionary of hooks.
+//
+// Why? This way, we can take advantage of the existing infra for the other
+// hooks (like calling the _call_hooks endpoint). I suppose a more adequate
+// name would be PyFunctionTensorPostAccGradHooks but let's follow the
+// precedent set by the hooks above (e.g., PyFunctionPreHook).
+struct PyFunctionTensorPostAccGradHook : public PostAccumulateGradHook {
+  PyFunctionTensorPostAccGradHook(PyObject* dict);
+  ~PyFunctionTensorPostAccGradHook() override;
+  void operator()(const Variable& tensor) override;
+  // fall back to the compiled_args of PostAccumulateGradHook superclass
+  PyObject* dict;
+};
+
 } // namespace autograd
 } // namespace torch
