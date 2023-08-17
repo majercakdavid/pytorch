@@ -2,6 +2,7 @@ import functools
 import itertools
 import logging
 import operator
+from collections import defaultdict, namedtuple
 from typing import List, Optional, Union
 
 from sympy import Expr
@@ -73,6 +74,8 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             patterns.apply(gm.graph)
         if is_inference:
             inference_patterns.apply(gm.graph)
+
+    reinplace_scatters(gm.graph)
 
     stable_topological_sort(gm.graph)
     gm.recompile()
@@ -549,6 +552,64 @@ def is_valid_splitwithsizes_cat(match):
         return False
 
     return True
+
+
+def _get_node_storage(node):
+    return node.meta["val"].storage()._cdata
+
+
+def reinplace_scatters(graph):
+    """
+    Reinplaces scatter operations in easy cases where the node being mutated
+    is only used by the scatter (users == 1)
+
+    Also handles input mutations when there is a corresponding copy node.
+    """
+
+    copy_nodes = {}
+    mutated_inputs = set()
+    storage_to_nodes = defaultdict(list)
+    for node in reversed(graph.nodes):
+        if isinstance(node.meta["val"], torch.Tensor):
+            storage_to_nodes[_get_node_storage(node)].append(node)
+        if node.target == aten.copy_.default:
+            copy_nodes[(node.args[0], node.args[1])] = node
+            mutated_inputs.add(node.args[0])
+        elif node.op == "output":
+            pass
+
+    InplaceableOp = namedtuple("InplaceableOp", ["inplace_op", "mutated_arg"])
+
+    inplaceable_ops = {
+        aten.index_put.default: InplaceableOp(aten.index_put_.default, 0),
+    }
+    for node in graph.nodes:
+        if inplaceable_op := inplaceable_ops.get(node.target, False):
+            mutated_arg = node.args[inplaceable_op.mutated_arg]
+            shared_view_nodes = storage_to_nodes[_get_node_storage(mutated_arg)]
+            if mutated_arg.op == "placeholder":
+                if not (copy_node := copy_nodes.get((mutated_arg, node), False)):
+                    continue
+
+                if (
+                    len(shared_view_nodes) > 2
+                ):  # Arg aliases another node other than copy_
+                    continue
+
+                # Check for any uses other than current node and copy_ epilogue
+                if len(mutated_arg.users) > 2:
+                    continue
+
+                graph.erase_node(copy_node)
+                node.target = inplaceable_op.inplace_op
+            else:
+                # NB: This condition could be relaxed if none of the aliases
+                # are used after this mutation op. But that's trickier.
+                if len(shared_view_nodes) > 1:  # Arg aliases another node
+                    continue
+                if len(mutated_arg.users) > 1:  # Arg used somewhere else
+                    continue
+                node.target = inplaceable_op.inplace_op
 
 
 @register_lowering_pattern(
