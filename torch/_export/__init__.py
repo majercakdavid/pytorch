@@ -215,7 +215,7 @@ def export(
                         return True
                 return False
 
-            if isinstance(f, torch.fx.GraphModule) and _safe_to_skip(f):
+            if False and isinstance(f, torch.fx.GraphModule) and _safe_to_skip(f):
                 gm_torch_level = f
             else:
                 with _wrap_submodules(f, preserve_module_call_signature, module_call_signatures):
