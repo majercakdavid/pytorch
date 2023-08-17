@@ -466,10 +466,10 @@ class TestSaveLoad(TestCase):
         ep = export(f, inp)
 
         buffer = io.BytesIO()
-        save(ep, buffer, {"extra.txt": "moo"})
+        save(ep, buffer, extra_files={"extra.txt": "moo"})
         buffer.seek(0)
         extra_files = {"extra.txt": ""}
-        loaded_ep = load(buffer, extra_files)
+        loaded_ep = load(buffer, extra_files=extra_files)
 
         self.assertTrue(torch.allclose(ep(*inp), loaded_ep(*inp)))
         self.assertEqual(extra_files["extra.txt"], "moo")

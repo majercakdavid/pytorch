@@ -430,11 +430,12 @@ def _reorder_kwargs_by_names(arg_names: List[str], args: Tuple[Any], kwargs: Dic
 def save(
     ep: ExportedProgram,
     f: Union[str, pathlib.Path, io.BytesIO],
+    *,
     extra_files: Optional[Dict[str, Any]] = None,
     opset_version: Optional[Dict[str, int]] = None,
 ) -> None:
     """
-    Saves a version of the given exported program for use in a separate process.
+    Saves an ExportedProgram to a file-like object.
 
     Args:
         ep (ExportedProgram): The exported program to save.
@@ -465,6 +466,7 @@ def save(
 
 def load(
     f: Union[str, pathlib.Path, io.BytesIO],
+    *,
     extra_files: Optional[Dict[str, Any]] = None,
     expected_opset_version: Optional[Dict[str, int]] = None,
 ) -> ExportedProgram:
