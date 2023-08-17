@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Type
 
 import onnx_test_common
 import onnxruntime  # type: ignore[import]
-import parameterized
+import parameterized  # type: ignore[import]
 import pytorch_test_common
 import torch
 import torch.onnx
@@ -27,7 +27,7 @@ from torch.onnx._internal.fx import (
 from torch.testing._internal import common_utils
 
 try:
-    import torchvision
+    import torchvision  # type: ignore[import]
 
     HAS_TORCHVISION = True
 except ImportError:
@@ -555,21 +555,52 @@ class TestFxToOnnxWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
             func, (torch.randn(3, 4),)
         )
 
-    def test_gpt2_tiny(self):
-        model_name = "sshleifer/tiny-gpt2"
-        # Download pytorch model
-        model = transformers.AutoModel.from_pretrained(model_name)
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+    def test_gpt2_tiny_from_config(self):
+        # Model
+        config = transformers.GPT2Config(
+            num_hidden_layers=4,
+            vocab_size=8096,
+            hidden_size=16,
+            intermediate_size=16,
+            max_position_embeddings=512,
+            num_attention_heads=2,
+            hidden_dropout_prob=0.0,
+            attention_dropout_prob=0.0,
+        )
+        model = transformers.GPT2Model(config).eval()
 
-        # Transform input tokens
-        inputs = tokenizer("Hello world!", return_tensors="pt")
-        another_inputs = tokenizer("Another Hello world!", return_tensors="pt")
+        # Encoded inputs
+        batch, seq = 2, 128
+        input_ids = torch.randint(0, 8096, (batch, seq))
+        attention_mask = torch.ones(batch, seq, dtype=torch.bool)
+        position_ids = torch.arange(0, seq, dtype=torch.long)
+        position_ids = position_ids.unsqueeze(0).view(-1, seq)
+
+        # Another encoded inputs to test dynamic shapes
+        another_batch, another_seq = 3, 256
+        another_input_ids = torch.randint(0, 8096, (another_batch, another_seq))
+        another_attention_mask = torch.ones(
+            another_batch, another_seq, dtype=torch.bool
+        )
+        another_position_ids = torch.arange(0, another_seq, dtype=torch.long)
+        another_position_ids = another_position_ids.unsqueeze(0).view(-1, another_seq)
 
         self.run_test_with_fx_to_onnx_exporter_and_onnx_runtime(
             model,
-            [],
-            input_kwargs=inputs,
-            additional_test_inputs=[((), another_inputs)],
+            (input_ids,),
+            input_kwargs={
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            additional_test_inputs=[
+                (
+                    (another_input_ids,),
+                    {
+                        "attention_mask": another_attention_mask,
+                        "position_ids": another_position_ids,
+                    },
+                )
+            ],
         )
 
     def test_prims_device_put(self):
@@ -745,14 +776,20 @@ class TestFxToOnnxWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
             create_pytorch_only_extra_kwargs,
         )
 
+    @pytorch_test_common.xfail(
+        "[ONNXRuntimeError] : 1 : FAIL : Type Error: Data in initializer 'h_0_attn_bias' "
+        "has element type tensor(uint8) but usage of initializer in graph expects tensor(bool)"
+        "https://github.com/huggingface/transformers/issues/21013"
+    )
     @pytorch_test_common.skip_dynamic_fx_test(
         "FakeTensor exporting is not supported by dynamic axes."
     )
     def test_fx_symbolic_tracer_large_scale_exporter_with_tiny_gpt2(self):
         model_name = "sshleifer/tiny-gpt2"
+        device = "cpu"
 
         def create_model() -> nn.Module:
-            return transformers.AutoModel.from_pretrained(model_name)
+            return transformers.AutoModel.from_pretrained(model_name).to(device).eval()
 
         def create_args():
             tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
@@ -935,11 +972,17 @@ class TestFxToOnnxFakeTensorWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
             export_within_fake_mode=self.export_within_fake_mode,
         )
 
+    @pytorch_test_common.xfail(
+        "[ONNXRuntimeError] : 1 : FAIL : Type Error: Data in initializer 'h_0_attn_bias' "
+        "has element type tensor(uint8) but usage of initializer in graph expects tensor(bool)"
+        "https://github.com/huggingface/transformers/issues/21013"
+    )
     def test_large_scale_exporter_with_tiny_gpt2(self):
         model_name = "sshleifer/tiny-gpt2"
+        device = "cpu"
 
         def create_model() -> nn.Module:
-            return transformers.AutoModel.from_pretrained(model_name)
+            return transformers.AutoModel.from_pretrained(model_name).to(device).eval()
 
         def create_args():
             tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
@@ -1011,6 +1054,7 @@ class TestFxToOnnxFakeTensorWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
         from transformers import AutoModel, AutoTokenizer  # type: ignore[import]
 
         model_name = "bigscience/bloom-560m"
+        device = "cpu"
 
         def create_args():
             return tuple()
@@ -1020,7 +1064,7 @@ class TestFxToOnnxFakeTensorWithOnnxRuntime(onnx_test_common._TestONNXRuntime):
             return tokenizer("Hello world!", return_tensors="pt")
 
         def create_model():
-            return AutoModel.from_pretrained(model_name)
+            return AutoModel.from_pretrained(model_name).to(device).eval()
 
         self._test_fake_tensor_mode_exporter(
             model_name.replace("/", "_"),
