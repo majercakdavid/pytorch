@@ -1,0 +1,2 @@
+dev,name,batch_size,speedup,abs_latency,compilation_latency,compression_ratio,eager_peak_mem,dynamo_peak_mem,calls_captured,unique_graphs,graph_breaks,unique_graph_breaks
+cuda,AlbertForMaskedLM,4,1.757132,152.764109,33.158308,1.942243,16.500774,8.495732,441,1,7,6

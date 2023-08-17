@@ -1945,7 +1945,7 @@ KERNEL_DICT = dict()
 
 
 class AutotunerRawData(NamedTuple):
-    IO_deps: Tuple[
+    io_deps: Tuple[
         List[dependencies.Dep], List[dependencies.Dep], List[int], List[int], List[int]
     ]
     read_write: dependencies.ReadWrites
@@ -1953,7 +1953,7 @@ class AutotunerRawData(NamedTuple):
     autotuner_dict: Dict
 
     def __repr__(self):
-        return f"AutotunerRawData({self.IO_deps}, {self.read_write}, {self.src_code}, {self.autotuner_dict})"
+        return f"AutotunerRawData({self.io_deps}, {self.read_write}, {self.src_code}, {self.autotuner_dict})"
 
 
 def autotuner_predict(autotuner_raw_data, autotuner_path):
@@ -2012,68 +2012,43 @@ def get_reads_writes(cur_scheduler, node, src_code):
     sizes = list()
     node_bytes = list()
 
-    # # To have deterministic order
-    # for dep in sorted(
-    #     list(node.read_writes.reads | node.read_writes.writes), key=lambda x: x.name
-    # ):
-    #     if dep.name not in reads | writes:
-    #         continue
-    #     if dep.name in V.graph.name_to_buffer:
-    #         buf = V.graph.name_to_buffer[dep.name]
-    #     elif dep.name in V.graph.graph_inputs:
-    #         buf = V.graph.graph_inputs[dep.name]
-    #     else:
-    #         continue
-
-    #     dep_removed.append(dep)
-    #     if isinstance(dep, (StarDep, WeakDep)):
-    #         strides.append(None)
-    #         sizes.append(None)
-    #         node_bytes.append(
-    #             V.graph.sizevars.size_hint(sympy_product(buf.get_size()))
-    #             * get_dtype_size(buf.get_dtype())
-    #         )
-    #     else:
-    #         strides.append(V.graph.sizevars.stride_hints(dep.index, dep.var_names))
-    #         sizes.append([V.graph.sizevars.size_hint(s) for s in dep.size])
-    #         node_bytes.append(
-    #             V.graph.sizevars.size_hint(sympy_product(dep.size))
-    #             * get_dtype_size(buf.get_dtype())
-    #         )
-
-    # assert len(dep_removed) == len(node_bytes) == len(strides) == len(sizes)
-
-    # return (
-    #     dep_removed[: len(reads)],
-    #     dep_removed[len(reads) :],
-    #     strides,
-    #     sizes,
-    #     node_bytes,
-    # )
-
-    def f(rw):
-        for buf in rw:
-            for dep in node.read_writes.reads | node.read_writes.writes:
-                if dep.name == buf:
-                    dep_removed.append(dep)
-
-            if buf in V.graph.name_to_buffer:
-                buf = V.graph.name_to_buffer[buf]
-            elif buf in V.graph.graph_inputs:
-                buf = V.graph.graph_inputs[buf]
+    # To have deterministic order
+    def f(dep_set):
+        for dep in sorted(list(dep_set), key=lambda x: x.name):
+            if dep.name not in reads | writes:
+                continue
+            if dep.name in V.graph.name_to_buffer:
+                buf = V.graph.name_to_buffer[dep.name]
+            elif dep.name in V.graph.graph_inputs:
+                buf = V.graph.graph_inputs[dep.name]
             else:
                 continue
 
-            node_bytes.append(
-                V.graph.sizevars.size_hint(sympy_product(buf.get_size()))
-                * get_dtype_size(buf.get_dtype())
-            )
+            dep_removed.append(dep)
+            if isinstance(dep, (StarDep, WeakDep)):
+                strides.append(None)
+                sizes.append(None)
+                node_bytes.append(
+                    V.graph.sizevars.size_hint(sympy_product(buf.get_size()))
+                    * get_dtype_size(buf.get_dtype())
+                )
+            else:
+                strides.append(V.graph.sizevars.stride_hints(dep.index, dep.var_names))
+                sizes.append([V.graph.sizevars.size_hint(s) for s in dep.size])
+                node_bytes.append(
+                    V.graph.sizevars.size_hint(sympy_product(dep.size))
+                    * get_dtype_size(buf.get_dtype())
+                )
 
-    f(reads)
-    f(writes)
+    f(node.read_writes.reads)
+    read_len = len(dep_removed)
+    f(node.read_writes.writes)
+    assert len(dep_removed) == len(node_bytes) == len(strides) == len(sizes)
     return (
-        dep_removed[: len(reads)],
-        dep_removed[len(reads) :],
+        dep_removed[:read_len],
+        dep_removed[read_len:],
+        strides,
+        sizes,
         node_bytes,
     )
 
@@ -2367,7 +2342,7 @@ class TritonScheduling:
             else:
                 node = scheduler.FusedSchedulerNode(self.scheduler, nodes)
             autotuner_raw_data = AutotunerRawData(
-                IO_deps=get_reads_writes(self.scheduler, node, src_code),
+                io_deps=get_reads_writes(self.scheduler, node, src_code),
                 read_write=node.read_writes,
                 src_code=src_code,
                 autotuner_dict=autotuner_dict,

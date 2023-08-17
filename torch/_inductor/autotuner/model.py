@@ -284,49 +284,36 @@ def pad_tensor():
     return tensor_feature
 
 
-def tensor_list(deps, total_bytes, rw_len):
-    rw_list = list(
-        [
-            (dep, bytes)
-            for dep, bytes in zip(deps, total_bytes)
-            if not isinstance(dep, (StarDep, WeakDep))
-        ]
-    )
+def tensor_list(deps, strides, sizes, total_bytes, rw_len):
     res = list()
     # sort the tensors by bytes in descending order
-    rw_list = sorted(rw_list, key=lambda x: x[1], reverse=True)
-    # for dep, strides, sizes, bytes in rw_list[:rw_len]:
-    for dep, bytes in rw_list[:rw_len]:
+    rw_list = sorted(
+        zip(deps, strides, sizes, total_bytes), key=lambda x: x[-1], reverse=True
+    )
+    for dep, strides, sizes, bytes in rw_list[:rw_len]:
         tensor_feature = pad_tensor()
         tensor_feature[0] = isinstance(dep, (StarDep, WeakDep))
         tensor_feature[1] = bytes
         # left pad strides, strides can be None if StarDep or WeakDep
-        # if strides is not None:
-        strides = V.graph.sizevars.stride_hints(dep.index, dep.var_names)
-        for i in range(len(strides)):
+        if strides is not None:
             # we use the lowest 6 dims of the tensor
-            tensor_feature[8 - (len(strides) - i)] = strides[i]
+            strides_trunced = strides[-6:]
+            tensor_feature[8 - len(strides_trunced) : 8] = strides_trunced
         # left pad size, sizes can be None if StarDep or WeakDep
-        # if sizes is not None:
-        sizes = [int(size_) for size_ in dep.size]
-        for i in range(len(sizes)):
+        if sizes is not None:
             # we use the lowest 6 dims of the tensor
-            tensor_feature[14 - (len(sizes) - i)] = sizes[i]
+            sizes_trunced = sizes[-6:]
+            tensor_feature[14 - len(sizes_trunced) : 14] = sizes_trunced
         tensor_feature[-3] = dep.is_contiguous()
         tensor_feature[-2] = dep.is_scalar()
         tensor_feature[-1] = dep.is_indirect()
 
-        # if strides is not None and sizes is not None:
-        #     assert len(strides) == len(sizes)
-        #     for size_ in sizes:
-        #         assert isinstance(size_, int)
-        #     for stride in strides:
-        #         assert isinstance(stride, int)
-        assert len(dep.size) == len(strides)
-        for size_ in dep.size:
-            assert size_.is_integer
-        for stride in strides:
-            assert isinstance(stride, int)
+        if strides is not None and sizes is not None:
+            assert len(strides) == len(sizes)
+            for size_ in sizes:
+                assert isinstance(size_, int)
+            for stride in strides:
+                assert isinstance(stride, int)
 
         res.append(tensor_feature)
     # right pad with empty tensor
@@ -553,8 +540,7 @@ class AutotunerModel:
 
     def get_feature_vec(self, configs, autotuner_raw_data):
         (
-            # (reads, writes, strides, sizes, total_bytes),
-            (reads, writes, total_bytes),
+            (reads, writes, strides, sizes, total_bytes),
             node_read_writes,
             src_code,
             autotuner_dict,
@@ -588,15 +574,15 @@ class AutotunerModel:
         # Get the input tensors and output tensors
         read_deps = tensor_list(
             reads,
-            # strides[: len(reads)],
-            # sizes[: len(reads)],
+            strides[: len(reads)],
+            sizes[: len(reads)],
             total_bytes[: len(reads)],
             self.input_tensor_lim,
         )
         write_deps = tensor_list(
             writes,
-            # strides[len(reads) :],
-            # sizes[len(reads) :],
+            strides[len(reads) :],
+            sizes[len(reads) :],
             total_bytes[len(reads) :],
             self.output_tensor_lim,
         )
