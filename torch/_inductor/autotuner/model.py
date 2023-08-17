@@ -12,6 +12,67 @@ from torch._inductor.virtualized import V
 
 
 ### model arch related
+# op_dict needs to be deterministic
+op_dict = {
+    "load": 0,
+    "to_dtype": 1,
+    "add": 2,
+    "reduction": 3,
+    "constant": 4,
+    "div": 5,
+    "store": 6,
+    "sub": 7,
+    "square": 8,
+    "rsqrt": 9,
+    "mul": 10,
+    "tanh": 11,
+    "ne": 12,
+    "where": 13,
+    "indirect_indexing": 14,
+    "log": 15,
+    "neg": 16,
+    "exp": 17,
+    "maximum": 18,
+    "minimum": 19,
+    "index_expr": 20,
+    "ge": 21,
+    "masked": 22,
+    "lt": 23,
+    "and_": 24,
+    "erf": 25,
+    "eq": 26,
+    "le": 27,
+    "gt": 28,
+    "relu": 29,
+    "sqrt": 30,
+    "logical_not": 31,
+    "load_seed": 32,
+    "rand": 33,
+    "abs": 34,
+    "reciprocal": 35,
+    "ceil": 36,
+    "sigmoid": 37,
+    "sin": 38,
+    "cos": 39,
+    "logical_and": 40,
+    "bitwise_and": 41,
+    "randn": 42,
+    "floor": 43,
+    "remainder": 44,
+    "isinf": 45,
+    "logical_or": 46,
+    "expm1": 47,
+    "libdevice_sqrt": 48,
+    "libdevice_log": 49,
+    "truediv": 50,
+    "sign": 51,
+    "randint64": 52,
+    "bitwise_or": 53,
+    "pow": 54,
+    "isnan": 55,
+}
+
+
 class ModelType(enumerate):
     XGB_BASELINE = 0
     NN_POINTWISE = 1
@@ -19,24 +80,37 @@ class ModelType(enumerate):
     NN_PAIRWISE_SMALL = 3
 
 
-class NN(nn.Module):
-    def __init__(self, hidden_dim, use_norm=True, activation="tanh"):
+class Autotuner_FFN(nn.Module):
+    def __init__(self, model_cfg):
         super().__init__()
 
         self.kernel_category_embedding = torch.nn.Embedding(
-            num_embeddings=3, embedding_dim=32
+            num_embeddings=model_cfg["kernel_category_cnt"],
+            embedding_dim=model_cfg["kernel_category_embed_dim"],
         )
         self.num_of_loops_embedding = torch.nn.Embedding(
-            num_embeddings=10, embedding_dim=32
+            num_embeddings=model_cfg["num_of_loops_cnt"],
+            embedding_dim=model_cfg["num_of_loops_embed_dim"],
         )
 
-        self.hidden_dim = [576] + hidden_dim + [1]
+        self.hidden_dim = [model_cfg["feature_dim"]] + model_cfg["hidden_dim"] + [1]
         self.num_layers = len(self.hidden_dim) - 1
 
-        self.op_bag_ln = nn.ModuleList([nn.Linear(1, 2) for i in range(56)])
-        self.is_contiguous_ln = torch.nn.Embedding(num_embeddings=2, embedding_dim=4)
-        self.is_scalar_ln = torch.nn.Embedding(num_embeddings=2, embedding_dim=4)
-        self.is_indirect_ln = torch.nn.Embedding(num_embeddings=2, embedding_dim=4)
+        self.op_bag_ln = nn.ModuleList(
+            [
+                nn.Linear(1, model_cfg["op_embed_dim"])
+                for i in range(model_cfg["op_cnt"])
+            ]
+        )
+        self.is_contiguous_ln = torch.nn.Embedding(
+            num_embeddings=2, embedding_dim=model_cfg["bool_embed_dim"]
+        )
+        self.is_scalar_ln = torch.nn.Embedding(
+            num_embeddings=2, embedding_dim=model_cfg["bool_embed_dim"]
+        )
+        self.is_indirect_ln = torch.nn.Embedding(
+            num_embeddings=2, embedding_dim=model_cfg["bool_embed_dim"]
+        )
 
         self.layers = nn.ModuleList(
             [
@@ -44,7 +118,7 @@ class NN(nn.Module):
                 for i in range(self.num_layers)
             ]
         )
-        self.use_norm = use_norm
+        self.use_norm = model_cfg["use_norm"]
         self.norms = nn.ModuleList(
             [nn.LayerNorm(self.hidden_dim[i + 1]) for i in range(self.num_layers - 1)]
         )
@@ -58,12 +132,7 @@ class NN(nn.Module):
             torch.nn.init.xavier_normal_(layer.weight)
             torch.nn.init.zeros_(layer.bias)
 
-        if activation == "tanh":
-            self.activation = torch.nn.functional.tanh
-        elif activation == "leaky_relu":
-            self.activation = torch.nn.functional.leaky_relu
-        else:
-            assert False, "Unknown activation"
+        self.activation = model_cfg["activation"]
 
     def forward(self, x):
         x = torch.cat(
@@ -127,77 +196,35 @@ def get_model(model_type: ModelType):
             predictor="cpu_predictor",
             eval_metric=["rmse", "mae"],
         )
-    elif model_type == ModelType.NN_POINTWISE:
-        return NN(hidden_dim=[8192, 2048, 32])
-    elif model_type == ModelType.NN_PAIRWISE:
-        return NN(hidden_dim=[4096, 1024, 32])
-    elif model_type == ModelType.NN_PAIRWISE_SMALL:
-        return NN(hidden_dim=[8192, 64], use_norm=False, activation="leaky_relu")
     else:
-        assert False, "Unknown model type"
+        model_cfg = {
+            "kernel_category_cnt": 3,
+            "kernel_category_embed_dim": 32,
+            "num_of_loops_cnt": 10,
+            "num_of_loops_embed_dim": 32,
+            "feature_dim": 576,
+            "op_embed_dim": 2,
+            "op_cnt": len(op_dict),
+            "bool_embed_dim": 4,
+            "use_norm": True,
+            "activation": torch.nn.functional.tanh,
+        }
+        if model_type == ModelType.NN_POINTWISE:
+            model_cfg["hidden_dim"] = [8192, 2048, 32]
+            return Autotuner_FFN(model_cfg)
+        elif model_type == ModelType.NN_PAIRWISE:
+            model_cfg["hidden_dim"] = [4096, 1024, 32]
+            return Autotuner_FFN(model_cfg)
+        elif model_type == ModelType.NN_PAIRWISE_SMALL:
+            model_cfg["hidden_dim"] = [8192, 64]
+            model_cfg["use_norm"] = False
+            model_cfg["activation"] = torch.nn.functional.leaky_relu
+            return Autotuner_FFN(model_cfg)
+        else:
+            assert False, "Unknown model type"
 
 
 ### feature extraction related
-
-# op_dict needs to be deterministic
-op_dict = {
-    "load": 0,
-    "to_dtype": 1,
-    "add": 2,
-    "reduction": 3,
-    "constant": 4,
-    "div": 5,
-    "store": 6,
-    "sub": 7,
-    "square": 8,
-    "rsqrt": 9,
-    "mul": 10,
-    "tanh": 11,
-    "ne": 12,
-    "where": 13,
-    "indirect_indexing": 14,
-    "log": 15,
-    "neg": 16,
-    "exp": 17,
-    "maximum": 18,
-    "minimum": 19,
-    "index_expr": 20,
-    "ge": 21,
-    "masked": 22,
-    "lt": 23,
-    "and_": 24,
-    "erf": 25,
-    "eq": 26,
-    "le": 27,
-    "gt": 28,
-    "relu": 29,
-    "sqrt": 30,
-    "logical_not": 31,
-    "load_seed": 32,
-    "rand": 33,
-    "abs": 34,
-    "reciprocal": 35,
-    "ceil": 36,
-    "sigmoid": 37,
-    "sin": 38,
-    "cos": 39,
-    "logical_and": 40,
-    "bitwise_and": 41,
-    "randn": 42,
-    "floor": 43,
-    "remainder": 44,
-    "isinf": 45,
-    "logical_or": 46,
-    "expm1": 47,
-    "libdevice_sqrt": 48,
-    "libdevice_log": 49,
-    "truediv": 50,
-    "sign": 51,
-    "randint64": 52,
-    "bitwise_or": 53,
-    "pow": 54,
-    "isnan": 55,
-}
 
 
 class KernelCategory(enumerate):

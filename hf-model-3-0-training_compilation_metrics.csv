@@ -1,0 +1,4 @@
+dev,name,batch_size,_compile,OutputGraph.call_user_compiler,create_aot_dispatcher_function,compile_fx.<locals>.fw_compiler_base,GraphLowering.run,GraphLowering.compile_to_module,Scheduler.__init__,Scheduler.codegen,WrapperCodeGen.generate,cudagraphify,compile_fx.<locals>.bw_compiler
+cuda,AlbertForMaskedLM,4,25.149808,20.690927,21.899306,5.615323,2.007056,8.577966,2.580973,2.159986,0.096516,0.010503,7.840978
+cuda,AlbertForQuestionAnswering,4,21.831012,18.260889,19.245559,4.922715,1.971652,7.439803,2.589304,1.974506,0.092840,0.002729,7.442052
+cuda,BartForCausalLM,4,35.285020,24.563276,24.206989,12.230469,2.430557,13.302566,3.418902,3.218270,0.198587,0.002801,8.802368
