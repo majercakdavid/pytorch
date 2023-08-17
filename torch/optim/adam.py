@@ -1,20 +1,30 @@
-from typing import List, Optional
+from typing import List, Optional, Union, Tuple
 
 import torch
 from torch import Tensor
-from .optimizer import (Optimizer, _use_grad_for_differentiable, _get_value, _stack_if_compiling,
-                        _dispatch_sqrt, _default_to_fused_or_foreach, _capturable_doc,
-                        _differentiable_doc, _foreach_doc, _fused_doc, _maximize_doc)
+from .optimizer import (Optimizer, params_t, _use_grad_for_differentiable, _get_value,
+                        _stack_if_compiling, _dispatch_sqrt, _default_to_fused_or_foreach,
+                        _capturable_doc, _differentiable_doc, _foreach_doc, _fused_doc,
+                        _maximize_doc)
 from torch.utils._foreach_utils import _get_fused_kernels_supported_devices
 
 __all__ = ['Adam', 'adam']
 
 
 class Adam(Optimizer):
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
-                 weight_decay=0, amsgrad=False, *, foreach: Optional[bool] = None,
-                 maximize: bool = False, capturable: bool = False,
-                 differentiable: bool = False, fused: Optional[bool] = None):
+    def __init__(self,
+                 params: params_t,
+                 lr: Union[float, Tensor] = 1e-3,
+                 betas: Tuple[float, float] = (0.9, 0.999),
+                 eps: float = 1e-8,
+                 weight_decay: float = 0,
+                 amsgrad: bool = False,
+                 *,
+                 foreach: Optional[bool] = None,
+                 maximize: bool = False,
+                 capturable: bool = False,
+                 differentiable: bool = False,
+                 fused: Optional[bool] = None):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= eps:
@@ -108,6 +118,11 @@ class Adam(Optimizer):
                     max_exp_avg_sqs.append(state['max_exp_avg_sq'])
                 if group['differentiable'] and state['step'].requires_grad:
                     raise RuntimeError('`requires_grad` is not supported for `step` in differentiable mode')
+
+                # Foreach without capturable does not support a tensor lr
+                if group['foreach'] and torch.is_tensor(group['lr']) and not group['capturable']:
+                    raise RuntimeError('`foreach` with a Tensor lr requires `capturable` to be `True`')
+
                 state_steps.append(state['step'])
 
     @_use_grad_for_differentiable
@@ -210,7 +225,9 @@ Adam.__doc__ = r"""Implements Adam algorithm.
     Args:
         params (iterable): iterable of parameters to optimize or dicts defining
             parameter groups
-        lr (float, optional): learning rate (default: 1e-3)
+        lr (float, Tensor, optional): learning rate (default: 1e-3). A tensor LR
+            is not yet supported for all our implementations. Please use a float
+            LR if you are not also specifying fused=True or capturable=True.
         betas (Tuple[float, float], optional): coefficients used for computing
             running averages of gradient and its square (default: (0.9, 0.999))
         eps (float, optional): term added to the denominator to improve
@@ -250,7 +267,7 @@ def adam(params: List[Tensor],
          amsgrad: bool,
          beta1: float,
          beta2: float,
-         lr: float,
+         lr: Union[float, Tensor],
          weight_decay: float,
          eps: float,
          maximize: bool):
@@ -264,6 +281,9 @@ def adam(params: List[Tensor],
     # bake-in time before making it the default, even if it is typically faster.
     if fused is None and foreach is None:
         _, foreach = _default_to_fused_or_foreach(params, differentiable, use_fused=False)
+        # Do not flip on foreach for the unsupported case where lr is a Tensor and capturable=False.
+        if foreach and torch.is_tensor(lr) and not capturable:
+            foreach = False
     if fused is None:
         fused = False
     if foreach is None:
@@ -276,6 +296,8 @@ def adam(params: List[Tensor],
 
     if foreach and torch.jit.is_scripting():
         raise RuntimeError('torch.jit.script not supported with foreach optimizers')
+    if fused and torch.jit.is_scripting():
+        raise RuntimeError("torch.jit.script not supported with fused optimizers")
 
     if fused and not torch.jit.is_scripting():
         func = _fused_adam
@@ -315,7 +337,7 @@ def _single_tensor_adam(params: List[Tensor],
                         amsgrad: bool,
                         beta1: float,
                         beta2: float,
-                        lr: float,
+                        lr: Union[float, Tensor],
                         weight_decay: float,
                         eps: float,
                         maximize: bool,
@@ -325,7 +347,6 @@ def _single_tensor_adam(params: List[Tensor],
     assert grad_scale is None and found_inf is None
 
     for i, param in enumerate(params):
-
         grad = grads[i] if not maximize else -grads[i]
         exp_avg = exp_avgs[i]
         exp_avg_sq = exp_avg_sqs[i]
@@ -419,7 +440,7 @@ def _multi_tensor_adam(params: List[Tensor],
                        amsgrad: bool,
                        beta1: float,
                        beta2: float,
-                       lr: float,
+                       lr: Union[float, Tensor],
                        weight_decay: float,
                        eps: float,
                        maximize: bool,
@@ -427,6 +448,9 @@ def _multi_tensor_adam(params: List[Tensor],
                        differentiable: bool):
     if len(params) == 0:
         return
+
+    if isinstance(lr, Tensor) and not capturable:
+        raise RuntimeError("A tensor lr with capturable=False is not supported in _multi_tensor_adam")
 
     # If compiling, the compiler will handle cudagraph checks, see note [torch.compile x capturable]
     if not torch._utils.is_compiling() and capturable:
@@ -548,7 +572,7 @@ def _fused_adam(
     amsgrad: bool,
     beta1: float,
     beta2: float,
-    lr: float,
+    lr: Union[float, Tensor],
     weight_decay: float,
     eps: float,
     maximize: bool,
@@ -557,19 +581,21 @@ def _fused_adam(
 ) -> None:
     if not params:
         return
+    if differentiable:
+        raise RuntimeError("_fused_adam is not differentiable")
+
     grad_scale_dict = {grad_scale.device: grad_scale} if grad_scale is not None else None
     found_inf_dict = {found_inf.device: found_inf} if found_inf is not None else None
+    lr_dict = {lr.device: lr} if isinstance(lr, Tensor) and lr.device != "cpu" else None
+
     grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
         [params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps])
-    for (device, dtype) in grouped_tensors:
-        ((
-            device_params,
-            device_grads,
-            device_exp_avgs,
-            device_exp_avg_sqs,
-            device_max_exp_avg_sqs,
-            device_state_steps,
-        ), _) = grouped_tensors[(device, dtype)]
+    for (device, _), ((device_params,
+                       device_grads,
+                       device_exp_avgs,
+                       device_exp_avg_sqs,
+                       device_max_exp_avg_sqs,
+                       device_state_steps,), _) in grouped_tensors.items():
         device_grad_scale, device_found_inf = None, None
         if grad_scale is not None:
             if device not in grad_scale_dict:
@@ -579,6 +605,9 @@ def _fused_adam(
             if found_inf not in found_inf_dict:
                 found_inf_dict[device] = found_inf.to(device, non_blocking=True)
             device_found_inf = found_inf_dict[device]
+        if lr_dict is not None and device not in lr_dict:
+            lr_dict[device] = lr.to(device=device, non_blocking=True)
+            lr = lr_dict[device]
         torch._foreach_add_(device_state_steps, 1)
         torch._fused_adam_(
             device_params,
