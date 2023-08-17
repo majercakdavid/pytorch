@@ -12,7 +12,6 @@ import os.path
 import re
 import pickle
 import threading
-import xgboost
 import numpy as np
 from enum import auto, Enum
 from typing import List, Set

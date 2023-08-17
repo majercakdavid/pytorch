@@ -15,13 +15,13 @@ import sympy
 import torch
 
 import torch._logging
-from torch import nn
 from torch._prims_common import is_integer_dtype
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from ..._dynamo.utils import counters
 from .. import config, ir, scheduler, dependencies
 from ..codecache import code_hash, get_path
 from ..ir import ReductionHint
+from ..dependencies import StarDep, WeakDep
 from ..optimize_indexing import indexing_dtype_strength_reduction
 from ..triton_heuristics import (
     AutotuneHint,
@@ -1956,9 +1956,11 @@ class AutotunerRawData(NamedTuple):
 
 def autotuner_predict(autotuner_raw_data, autotuner_path):
     autotuner_dict = autotuner_raw_data.autotuner_dict
-    src = autotuner_raw_data.src
-    # get heursitic configs
-    configs = get_heuristic_configs(autotuner_dict)
+    src = autotuner_raw_data.src_code
+    # get max autotune heursitic configs
+    # we need to turn on max_autotune_pointwise to get these
+    config.max_autotune_pointwise = True
+    configs, _ = get_heuristic_configs(autotuner_dict)
     if len(configs) == 1:
         return configs[:1]
 
@@ -1976,13 +1978,19 @@ def autotuner_predict(autotuner_raw_data, autotuner_path):
 
     autotuner = load_model(autotuner_path)
     assert isinstance(autotuner, AutotunerModel)
+
+    # for cfg in configs:
+    #     print(cfg.kwargs, cfg.num_stages, cfg.num_warps)
+    #     print(autotuner_raw_data)
+    #     print(autotuner.get_feature_vec([cfg], autotuner_raw_data))
+
     predicted_configs = autotuner.predict(
         configs, autotuner_raw_data, config.triton.autotuner_space
     )
     return predicted_configs
 
 
-def get_reads_writes(cur_scheduler, node):
+def get_reads_writes(cur_scheduler, node, src_code):
     if isinstance(node, scheduler.NopKernelSchedulerNode):
         return 0
     reads = {dep.name for dep in node.read_writes.reads}
@@ -2002,12 +2010,49 @@ def get_reads_writes(cur_scheduler, node):
     sizes = list()
     node_bytes = list()
 
+    # # To have deterministic order
+    # for dep in sorted(
+    #     list(node.read_writes.reads | node.read_writes.writes), key=lambda x: x.name
+    # ):
+    #     if dep.name not in reads | writes:
+    #         continue
+    #     if dep.name in V.graph.name_to_buffer:
+    #         buf = V.graph.name_to_buffer[dep.name]
+    #     elif dep.name in V.graph.graph_inputs:
+    #         buf = V.graph.graph_inputs[dep.name]
+    #     else:
+    #         continue
+
+    #     dep_removed.append(dep)
+    #     if isinstance(dep, (StarDep, WeakDep)):
+    #         strides.append(None)
+    #         sizes.append(None)
+    #         node_bytes.append(
+    #             V.graph.sizevars.size_hint(sympy_product(buf.get_size()))
+    #             * get_dtype_size(buf.get_dtype())
+    #         )
+    #     else:
+    #         strides.append(V.graph.sizevars.stride_hints(dep.index, dep.var_names))
+    #         sizes.append([V.graph.sizevars.size_hint(s) for s in dep.size])
+    #         node_bytes.append(
+    #             V.graph.sizevars.size_hint(sympy_product(dep.size))
+    #             * get_dtype_size(buf.get_dtype())
+    #         )
+
+    # assert len(dep_removed) == len(node_bytes) == len(strides) == len(sizes)
+
+    # return (
+    #     dep_removed[: len(reads)],
+    #     dep_removed[len(reads) :],
+    #     strides,
+    #     sizes,
+    #     node_bytes,
+    # )
+
     def f(rw):
         for buf in rw:
-            cur_dep = None
             for dep in node.read_writes.reads | node.read_writes.writes:
                 if dep.name == buf:
-                    cur_dep = dep
                     dep_removed.append(dep)
 
             if buf in V.graph.name_to_buffer:
@@ -2017,24 +2062,16 @@ def get_reads_writes(cur_scheduler, node):
             else:
                 continue
 
-            strides.append(
-                V.graph.sizevars.stride_hints(cur_dep.index, cur_dep.var_names)
-            )
-            sizes.append([V.graph.sizevars.size_hint(s) for s in buf.get_size()])
             node_bytes.append(
                 V.graph.sizevars.size_hint(sympy_product(buf.get_size()))
                 * get_dtype_size(buf.get_dtype())
             )
 
-    # To have deterministic order
-    f(sorted(reads))
-    f(sorted(writes))
-    assert len(dep_removed) == len(node_bytes) == len(strides) == len(sizes)
+    f(reads)
+    f(writes)
     return (
         dep_removed[: len(reads)],
         dep_removed[len(reads) :],
-        strides,
-        sizes,
         node_bytes,
     )
 
@@ -2317,31 +2354,22 @@ class TritonScheduling:
             or config.triton.autotuner_path is not None
         ):
             src_code, autotuner_dict = kernel.codegen_kernel(get_autotuner_dict=True)
-            nodes = filter(
-                lambda n: n not in (EnableReduction, DisableReduction), node_schedule
+            nodes = list(
+                filter(
+                    lambda n: n not in (EnableReduction, DisableReduction),
+                    node_schedule,
+                )
             )
             if len(nodes) == 1:
                 node = nodes[0]
             else:
                 node = scheduler.FusedSchedulerNode(self.scheduler, nodes)
             autotuner_raw_data = AutotunerRawData(
-                IO_deps=get_reads_writes(self.scheduler, node),
+                IO_deps=get_reads_writes(self.scheduler, node, src_code),
                 read_write=node.read_writes,
                 src_code=src_code,
                 autotuner_dict=autotuner_dict,
             )
-
-            if config.triton.dump_autotuner_data:
-                # autotuner training data dump
-                tuning_metadata_path = self.kernel_path_ + ".pkl"
-                if not os.path.exists(os.path.dirname(tuning_metadata_path)):
-                    os.makedirs(os.path.dirname(tuning_metadata_path))
-                if not os.path.exists(tuning_metadata_path):
-                    log.debug("Kernel path : " + self.kernel_path_)
-                    log.debug("Metadata path : " + tuning_metadata_path)
-                    log.debug(str(autotuner_raw_data))
-                    with open(tuning_metadata_path, "wb") as f:
-                        pickle.dump(autotuner_raw_data, f)
 
             if config.triton.autotuner_path is not None:
                 # autotuner inference
@@ -2367,6 +2395,20 @@ class TritonScheduling:
 
         kernel_name = self.define_kernel(src_code, node_schedule)
         kernel.call_kernel(kernel_name)
+
+        if config.triton.dump_autotuner_data:
+            # autotuner training data dump
+            tuning_metadata_path = self.kernel_path_ + ".pkl"
+            if not os.path.exists(os.path.dirname(tuning_metadata_path)):
+                os.makedirs(os.path.dirname(tuning_metadata_path))
+            if not os.path.exists(tuning_metadata_path):
+                # only dump if the file does not exist
+                # otherwise we will overwrite the existing file with possibly a different kernel
+                log.debug("Kernel path : " + self.kernel_path_)
+                log.debug("Metadata path : " + tuning_metadata_path)
+                log.debug(str(autotuner_raw_data))
+                with open(tuning_metadata_path, "wb") as f:
+                    pickle.dump(autotuner_raw_data, f)
 
         if config.warn_mix_layout:
             kernel.warn_mix_layout(kernel_name)

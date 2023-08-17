@@ -8,6 +8,7 @@ from torch import nn
 from torch._inductor.dependencies import StarDep, WeakDep
 from torch._inductor import config
 from torch._inductor.triton_heuristics import unique_configs
+from torch._inductor.virtualized import V
 
 
 ### model arch related
@@ -19,7 +20,7 @@ class ModelType(enumerate):
 
 
 class NN(nn.Module):
-    def __init__(self, hidden_dim, use_norm=True):
+    def __init__(self, hidden_dim, use_norm=True, activation="tanh"):
         super().__init__()
 
         self.kernel_category_embedding = torch.nn.Embedding(
@@ -44,13 +45,9 @@ class NN(nn.Module):
             ]
         )
         self.use_norm = use_norm
-        if use_norm:
-            self.norms = nn.ModuleList(
-                [
-                    nn.LayerNorm(self.hidden_dim[i + 1])
-                    for i in range(self.num_layers - 1)
-                ]
-            )
+        self.norms = nn.ModuleList(
+            [nn.LayerNorm(self.hidden_dim[i + 1]) for i in range(self.num_layers - 1)]
+        )
 
         torch.nn.init.xavier_normal_(self.kernel_category_embedding.weight)
         torch.nn.init.xavier_normal_(self.num_of_loops_embedding.weight)
@@ -60,6 +57,13 @@ class NN(nn.Module):
         for layer in list(self.op_bag_ln) + list(self.layers):
             torch.nn.init.xavier_normal_(layer.weight)
             torch.nn.init.zeros_(layer.bias)
+        
+        if activation == "tanh":
+            self.activation = torch.nn.functional.tanh
+        elif activation == "leaky_relu":
+            self.activation = torch.nn.functional.leaky_relu
+        else:
+            assert False, "Unknown activation"
 
     def forward(self, x):
         x = torch.cat(
@@ -103,10 +107,10 @@ class NN(nn.Module):
         )
         if self.use_norm:
             for norm, layer in zip(self.norms, self.layers[:-1]):
-                x = torch.nn.functional.tanh(norm(layer(x)))
+                x = self.activation(norm(layer(x)))
         else:
             for layer in self.layers[:-1]:
-                x = torch.nn.functional.tanh(layer(x))
+                x = self.activation(layer(x))
         x = self.layers[-1](x)
         return x
 
@@ -128,7 +132,7 @@ def get_model(model_type: ModelType):
     elif model_type == ModelType.NN_PAIRWISE:
         return NN(hidden_dim=[4096, 1024, 32])
     elif model_type == ModelType.NN_PAIRWISE_SMALL:
-        return NN(hidden_dim=[8192, 64], use_norm=False)
+        return NN(hidden_dim=[8192, 64], use_norm=False, activation="leaky_relu")
     else:
         assert False, "Unknown model type"
 
@@ -253,19 +257,31 @@ def pad_tensor():
     return tensor_feature
 
 
-def tensor_list(rw_list, rw_len):
+def tensor_list(deps, total_bytes, rw_len):
+    rw_list = list(
+        [
+            (dep, bytes)
+            for dep, bytes in zip(deps, total_bytes)
+            if not isinstance(dep, (StarDep, WeakDep))
+        ]
+    )
     res = list()
     # sort the tensors by bytes in descending order
-    rw_list = sorted(rw_list, key=lambda x: x[3], reverse=True)
-    for dep, strides, sizes, bytes in rw_list[:rw_len]:
+    rw_list = sorted(rw_list, key=lambda x: x[1], reverse=True)
+    # for dep, strides, sizes, bytes in rw_list[:rw_len]:
+    for dep, bytes in rw_list[:rw_len]:
         tensor_feature = pad_tensor()
         tensor_feature[0] = isinstance(dep, (StarDep, WeakDep))
         tensor_feature[1] = bytes
-        # left pad strides
+        # left pad strides, strides can be None if StarDep or WeakDep
+        # if strides is not None:
+        strides = V.graph.sizevars.stride_hints(dep.index, dep.var_names)
         for i in range(len(strides)):
             # we use the lowest 6 dims of the tensor
             tensor_feature[8 - (len(strides) - i)] = strides[i]
-        # left pad size
+        # left pad size, sizes can be None if StarDep or WeakDep
+        # if sizes is not None:
+        sizes = [int(size_) for size_ in dep.size]
         for i in range(len(sizes)):
             # we use the lowest 6 dims of the tensor
             tensor_feature[14 - (len(sizes) - i)] = sizes[i]
@@ -273,8 +289,14 @@ def tensor_list(rw_list, rw_len):
         tensor_feature[-2] = dep.is_scalar()
         tensor_feature[-1] = dep.is_indirect()
 
-        assert len(sizes) == len(strides)
-        for size_ in sizes:
+        # if strides is not None and sizes is not None:
+        #     assert len(strides) == len(sizes)
+        #     for size_ in sizes:
+        #         assert isinstance(size_, int)
+        #     for stride in strides:
+        #         assert isinstance(stride, int)
+        assert len(dep.size) == len(strides)
+        for size_ in dep.size:
             assert size_.is_integer
         for stride in strides:
             assert isinstance(stride, int)
@@ -430,7 +452,7 @@ class SearchSpaceGenerator:
         choices = itertools.product(*candidate_values_list)
         for choice in choices:
             assert len(choice) == len(effective_fields)
-            candidate_config = copy.deepcopy(radius)
+            candidate_config = copy.deepcopy(st_config)
             for new_val, field in zip(choice, effective_fields):
                 self.set_field(candidate_config, field, new_val)
             res.append(candidate_config)
@@ -448,7 +470,7 @@ class AutotunerModel:
 
     def __init__(self, model_type):
         self.model_type = model_type
-        self.model = self.get_model()
+        self.model = get_model(model_type)
         self.input_tensor_lim = 10
         self.output_tensor_lim = 5
 
@@ -461,22 +483,29 @@ class AutotunerModel:
     def score(self, configs, autotuner_raw_data):
         X = self.get_feature_vec(configs, autotuner_raw_data)
         if self.model_type == ModelType.XGB_BASELINE:
-            scores = self.model.predict(X)[::-1]
+            scores = self.model.predict(X) * -1
         else:
+            self.model.to(torch.device("cuda"))
+            self.model.eval()
             X = torch.from_numpy(X).to(torch.device("cuda"))
-            scores = self.model(X).squeeze().cpu().detach().numpy()
+            scores = self.model.forward(X).squeeze().cpu().detach().numpy()
             if self.model_type == ModelType.NN_POINTWISE:
-                scores = reversed(scores)
+                scores = scores * -1
         indices = np.argsort(scores)
         return [configs[i] for i in indices]
 
     def predict(self, configs, autotuner_raw_data, autotuner_space):
+        _, _, src_code, _ = autotuner_raw_data
+        size_hints = get_size_hints(src_code)
+
         configs = unique_configs(configs)
         if autotuner_space in [
             AutotunerSpaceCategory.RADIUS_1_TOP1,
             AutotunerSpaceCategory.RADIUS_1_TOP2,
         ]:
-            configs = unique_configs(SearchSpaceGenerator().generate(configs, radius=1))
+            configs = unique_configs(
+                SearchSpaceGenerator(size_hints).generate(configs, radius=1)
+            )
 
         configs = self.score(configs, autotuner_raw_data)
         if autotuner_space in [
@@ -494,9 +523,11 @@ class AutotunerModel:
 
     def get_feature_vec(self, configs, autotuner_raw_data):
         (
-            (reads, writes, strides, sizes, total_bytes),
+            # (reads, writes, strides, sizes, total_bytes),
+            (reads, writes, total_bytes),
             node_read_writes,
             src_code,
+            autotuner_dict,
         ) = autotuner_raw_data
 
         # Get the kernel category
@@ -522,24 +553,21 @@ class AutotunerModel:
 
         # Get the size hints
         size_hints = get_size_hints(src_code)
+        assert size_hints == autotuner_dict["size_hints"]
 
         # Get the input tensors and output tensors
-        reads = tensor_list(
-            zip(
-                reads,
-                strides[: len(reads)],
-                sizes[: len(reads)],
-                total_bytes[: len(reads)],
-            ),
+        read_deps = tensor_list(
+            reads,
+            # strides[: len(reads)],
+            # sizes[: len(reads)],
+            total_bytes[: len(reads)],
             self.input_tensor_lim,
         )
-        writes = tensor_list(
-            zip(
-                writes,
-                strides[len(reads) :],
-                sizes[len(reads) :],
-                total_bytes[len(reads) :],
-            ),
+        write_deps = tensor_list(
+            writes,
+            # strides[len(reads) :],
+            # sizes[len(reads) :],
+            total_bytes[len(reads) :],
             self.output_tensor_lim,
         )
 
@@ -557,9 +585,9 @@ class AutotunerModel:
                 size_hints_vec[i] = size_hints[i]
             feature_vector.extend(size_hints_vec)
 
-            for tensor in reads:
+            for tensor in read_deps:
                 feature_vector.extend(tensor)
-            for tensor in writes:
+            for tensor in write_deps:
                 feature_vector.extend(tensor)
 
             if "XBLOCK" in config.kwargs:
@@ -587,7 +615,7 @@ class AutotunerModel:
 
         if self.model_type != ModelType.XGB_BASELINE:
             # num_of_loops is embedded
-            num_of_loops = min(num_of_loops, 10)
+            X[:, 1][X[:, 1] > 9] = 9
 
             X = X.astype(np.float32)
             X[:, 58:60] = np.log2(X[:, 58:60] + 1)  # size_hints
