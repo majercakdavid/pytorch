@@ -1936,7 +1936,9 @@ def get_heuristic_configs(autotuner_dict):
 @functools.lru_cache(None)
 def load_model(autotuner_path):
     log.debug(f"loading model, pid {os.getpid()}")
-    return pickle.load(open(autotuner_path, "rb"))
+    autotuner_model = pickle.load(open(autotuner_path, "rb"))
+    autotuner_model.prepare()
+    return autotuner_model
 
 
 KERNEL_DICT = dict()

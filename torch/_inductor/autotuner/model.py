@@ -57,7 +57,7 @@ class NN(nn.Module):
         for layer in list(self.op_bag_ln) + list(self.layers):
             torch.nn.init.xavier_normal_(layer.weight)
             torch.nn.init.zeros_(layer.bias)
-        
+
         if activation == "tanh":
             self.activation = torch.nn.functional.tanh
         elif activation == "leaky_relu":
@@ -480,14 +480,17 @@ class AutotunerModel:
         else:
             self.model.load_state_dict(torch.load(path))
 
+    def prepare(self):
+        if self.model_type != ModelType.XGB_BASELINE:
+            self.model = self.model.to("cuda")
+            self.model.eval()
+
     def score(self, configs, autotuner_raw_data):
         X = self.get_feature_vec(configs, autotuner_raw_data)
         if self.model_type == ModelType.XGB_BASELINE:
             scores = self.model.predict(X) * -1
         else:
-            self.model.to(torch.device("cuda"))
-            self.model.eval()
-            X = torch.from_numpy(X).to(torch.device("cuda"))
+            X = torch.from_numpy(X).to("cuda")
             scores = self.model.forward(X).squeeze().cpu().detach().numpy()
             if self.model_type == ModelType.NN_POINTWISE:
                 scores = scores * -1
